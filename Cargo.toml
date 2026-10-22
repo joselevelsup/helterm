@@ -1,0 +1,28 @@
+[package]
+name = "vibe_term"
+version = "0.1.0"
+edition = "2021"
+description = "A project terminal: tiled terminals and Helix editors, grouped into workspaces"
+repository = "https://github.com/joselevelsup/vibe_term"
+license = "MIT"
+
+[dependencies]
+gpui = "0.2"
+alacritty_terminal = "0.24"
+portable-pty = "0.8"
+async-channel = "2"
+# Both already in the tree via gpui: parsing the config adds nothing new to build.
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[profile.release]
+lto = "thin"
+strip = true
+
+# Debug builds of gpui/text shaping are ~10x slower per frame; optimize deps only.
+[profile.dev.package."*"]
+opt-level = 3
+
+# local patch of xattr 0.2.3 (ENOATTR const was dropped from libc on linux)
+[patch.crates-io]
+xattr = { path = "vendored/xattr" }

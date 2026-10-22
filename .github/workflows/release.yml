@@ -1,0 +1,59 @@
+# Publishes a prebuilt Linux archive to GitHub Releases.
+#
+#   1. Bump `version` in Cargo.toml and commit.
+#   2. git tag v0.1.0 && git push origin v0.1.0
+#
+# Running it by hand (Actions tab -> Release -> Run workflow) builds the same
+# archive and attaches it to the run instead of publishing a release.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # create the release and upload its files
+
+jobs:
+  linux-x86_64:
+    # Built on the oldest supported Ubuntu so the binary runs on any distro with
+    # glibc 2.35 or newer (Ubuntu 22.04+, Debian 12+, Fedora, Arch, ...).
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev \
+            libwayland-dev libvulkan-dev libfontconfig-dev libfreetype-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build archive
+        run: packaging/make-release.sh
+        env:
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+
+      - name: Publish release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          generate_release_notes: true
+
+      - name: Attach archive to the run
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: vibe_term-linux-x86_64
+          path: dist/*.tar.gz*

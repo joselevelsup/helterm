@@ -1,0 +1,69 @@
+# vibe_term configuration, created with the defaults on first start at
+# $XDG_CONFIG_HOME/vibe_term/config.toml (usually ~/.config/vibe_term/).
+# Change what you like; every setting is optional and anything you delete
+# goes back to its default. Restart vibe_term to apply changes.
+
+[font]
+family = "JetBrainsMono Nerd Font"
+size = 15
+
+# App chrome: sidebar, tabs, explorer, dialogs. Colors are "#rrggbb".
+[colors.ui]
+background = "#1e1e2e"
+panel = "#181825"   # tab bar, explorer
+sidebar = "#11111b" # workspace bar, input boxes
+element = "#313244" # hover, selection, quiet borders
+border = "#45475a"
+text = "#cdd6f4"
+muted = "#7f849c"
+accent = "#89b4fa"  # focus borders, headings
+error = "#f38ba8"
+warning = "#f9e2af"
+
+# What programs in the terminal see. (Helix draws with its own theme.)
+[colors.terminal]
+foreground = "#cdd6f4"
+background = "#1e1e2e"
+cursor = "#89b4fa"
+black = "#45475a"
+red = "#f38ba8"
+green = "#a6e3a1"
+yellow = "#f9e2af"
+blue = "#89b4fa"
+magenta = "#f5c2e7"
+cyan = "#94e2d5"
+white = "#bac2de"
+bright_black = "#585b70"
+bright_red = "#f38ba8"
+bright_green = "#a6e3a1"
+bright_yellow = "#f9e2af"
+bright_blue = "#89b4fa"
+bright_magenta = "#f5c2e7"
+bright_cyan = "#94e2d5"
+bright_white = "#a6adc8"
+
+# action = "key", a list of keys, or "" to unbind. Modifiers: ctrl, alt,
+# shift, super. Chords are space separated: "ctrl-k ctrl-t".
+# A key belongs to one action: duplicates are reported, and a key you set
+# yourself wins over a default (between two of yours, the one listed first).
+[keybindings]
+split_right = "alt-enter"
+split_down = "alt-shift-enter"
+new_editor = "alt-o"
+close_container = "alt-q"
+close_workspace = "alt-shift-q"
+new_workspace = "alt-shift-n"
+next_workspace = "alt-tab"        # COSMIC/GNOME/KDE use Alt+Tab to switch windows;
+prev_workspace = "alt-shift-tab"  # free it there or pick another key here
+focus_left = "alt-h"
+focus_down = "alt-j"
+focus_up = "alt-k"
+focus_right = "alt-l"
+toggle_explorer = "alt-e"
+new_tab = "alt-t"
+next_tab = "alt-]"
+prev_tab = "alt-["
+toggle_sidebar = "alt-b"
+toggle_maximize = "alt-m"
+toggle_floating = "alt-f"
+float_focused = "alt-shift-f"

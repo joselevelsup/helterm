@@ -1,0 +1,5 @@
+/target
+/dist
+# Machine-local linker workaround (see README), never needed in CI.
+/.cargo/config.toml
+/.libs/
