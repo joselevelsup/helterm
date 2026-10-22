@@ -142,6 +142,8 @@ pub struct Config {
     pub font_size: f32,
     /// Action name -> key strings (validated). Empty means unbound.
     keys: HashMap<&'static str, Vec<String>>,
+    /// Floating terminals that run a command, each on its own key.
+    pub floating_commands: Vec<FloatingCommand>,
     /// Problems found while loading, shown to the user.
     pub warnings: Vec<String>,
 }
@@ -159,9 +161,17 @@ impl Default for Config {
                 .iter()
                 .map(|(name, key, _)| (*name, vec![key.to_string()]))
                 .collect(),
+            floating_commands: vec![],
             warnings: vec![],
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FloatingCommand {
+    pub command: String,
+    /// Validated keys; empty if they all clashed with other bindings.
+    keys: Vec<String>,
 }
 
 // The file format. Everything optional.
@@ -171,6 +181,31 @@ struct File {
     font: FontFile,
     colors: ColorsFile,
     keybindings: HashMap<String, Keys>,
+    floating_commands: Vec<FloatingCommandFile>,
+}
+
+#[derive(Deserialize)]
+struct FloatingCommandFile {
+    key: Option<Keys>,
+    command: Option<String>,
+}
+
+/// Validate a key / list of keys; bad ones become warnings. "" unbinds.
+fn checked_keys(keys: Keys, what: &str, warnings: &mut Vec<String>) -> Vec<String> {
+    let keys = match keys {
+        Keys::One(key) => vec![key],
+        Keys::Many(keys) => keys,
+    };
+    keys.into_iter()
+        .filter(|key| !key.trim().is_empty())
+        .filter(|key| {
+            let ok = valid_key(key);
+            if !ok {
+                warnings.push(format!("{what}: invalid key \"{key}\""));
+            }
+            ok
+        })
+        .collect()
 }
 
 #[derive(Deserialize, Default)]
@@ -323,23 +358,24 @@ impl Config {
                 config.warnings.push(format!("unknown action keybindings.{name}"));
                 continue;
             };
-            let keys = match keys {
-                Keys::One(key) => vec![key],
-                Keys::Many(keys) => keys,
-            };
-            let mut valid = vec![];
-            for key in keys {
-                if key.trim().is_empty() {
-                    continue; // "" unbinds
-                }
-                if valid_key(&key) {
-                    valid.push(key);
-                } else {
-                    config.warnings.push(format!("keybindings.{name}: invalid key \"{key}\""));
-                }
-            }
+            let valid = checked_keys(keys, &format!("keybindings.{name}"), &mut config.warnings);
             config.keys.insert(action, valid);
             explicit.insert(*action);
+        }
+        for (ix, float) in file.floating_commands.into_iter().enumerate() {
+            let what = format!("floating_commands[{}]", ix + 1);
+            let Some(command) = float.command.filter(|c| !c.trim().is_empty()) else {
+                config.warnings.push(format!("{what}: needs a command, e.g. command = \"lazygit\""));
+                continue;
+            };
+            let keys = match float.key {
+                Some(keys) => checked_keys(keys, &what, &mut config.warnings),
+                None => {
+                    config.warnings.push(format!("{what} (\"{command}\"): needs a key, e.g. key = \"alt-g\""));
+                    continue;
+                }
+            };
+            config.floating_commands.push(FloatingCommand { command, keys });
         }
         config.drop_duplicate_keys(&explicit);
         config
@@ -347,42 +383,59 @@ impl Config {
 
     /// One key, one action. Keys you set beat defaults; between two of yours,
     /// the action listed first (see config.example.toml) keeps the key.
+    /// One key, one action. Keys you set beat defaults; between two of yours,
+    /// the one listed first wins: [keybindings] (in the order of
+    /// config.example.toml), then [[floating_commands]] (in file order).
     fn drop_duplicate_keys(&mut self, explicit: &std::collections::HashSet<&'static str>) {
-        let names = ACTIONS.iter().map(|(name, _, _)| *name);
-        let order: Vec<&'static str> = names
-            .clone()
-            .filter(|n| explicit.contains(n))
-            .chain(names.filter(|n| !explicit.contains(n)))
-            .collect();
-        let mut owner: HashMap<String, &'static str> = HashMap::new();
-        for name in order {
+        let mut owner: HashMap<String, String> = HashMap::new();
+        let mut claim = |name: String, keys: Vec<String>, warnings: &mut Vec<String>| {
             let mut kept = vec![];
-            for key in std::mem::take(self.keys.get_mut(name).unwrap()) {
+            for key in keys {
                 match owner.get(&normalize(&key)) {
-                    Some(winner) if *winner == name => {} // listed twice for the same action
-                    Some(winner) => self.warnings.push(format!(
+                    Some(winner) if *winner == name => {} // listed twice for the same thing
+                    Some(winner) => warnings.push(format!(
                         "\"{key}\" is bound to both {winner} and {name}; {winner} keeps it"
                     )),
                     None => {
-                        owner.insert(normalize(&key), name);
+                        owner.insert(normalize(&key), name.clone());
                         kept.push(key);
                     }
                 }
             }
+            kept
+        };
+        let names = ACTIONS.iter().map(|(name, _, _)| *name);
+        for name in names.clone().filter(|n| explicit.contains(n)) {
+            let keys = std::mem::take(self.keys.get_mut(name).unwrap());
+            let kept = claim(name.to_owned(), keys, &mut self.warnings);
+            self.keys.insert(name, kept);
+        }
+        for float in &mut self.floating_commands {
+            let name = format!("floating command \"{}\"", float.command);
+            float.keys = claim(name, std::mem::take(&mut float.keys), &mut self.warnings);
+        }
+        for name in names.filter(|n| !explicit.contains(n)) {
+            let keys = std::mem::take(self.keys.get_mut(name).unwrap());
+            let kept = claim(name.to_owned(), keys, &mut self.warnings);
             self.keys.insert(name, kept);
         }
     }
 
     pub fn bindings(&self) -> Vec<KeyBinding> {
-        ACTIONS
+        // Keys were validated while parsing, so `ok()` only skips the impossible.
+        let bind = |key: &str, action: Box<dyn Action>| {
+            KeyBinding::load(key, action, None, false, None, &DummyKeyboardMapper).ok()
+        };
+        let actions = ACTIONS
             .iter()
-            .flat_map(|(name, _, action)| {
-                self.keys[name].iter().filter_map(move |key| {
-                    // Keys were validated while parsing, so this only skips the impossible.
-                    KeyBinding::load(key, action(), None, false, None, &DummyKeyboardMapper).ok()
-                })
-            })
-            .collect()
+            .flat_map(|(name, _, action)| self.keys[name].iter().filter_map(move |key| bind(key, action())));
+        let floats = self.floating_commands.iter().enumerate().flat_map(|(index, float)| {
+            float
+                .keys
+                .iter()
+                .filter_map(move |key| bind(key, Box::new(RunFloatingCommand { index })))
+        });
+        actions.chain(floats).collect()
     }
 
     /// Human-readable first key for an action, e.g. "Alt+Shift+F".
@@ -526,6 +579,7 @@ mod tests {
         assert_eq!(example.font_family, defaults.font_family);
         assert_eq!(example.font_size, defaults.font_size);
         assert_eq!(example.keys, defaults.keys);
+        assert_eq!(example.floating_commands, defaults.floating_commands);
     }
 
     #[test]
@@ -551,6 +605,51 @@ mod tests {
         assert!(config.warnings.is_empty(), "{:?}", config.warnings);
         assert_eq!(config.keys["new_tab"], vec!["alt-t"]);
         assert_eq!(config.bindings().len(), ACTIONS.len());
+    }
+
+    #[test]
+    fn floating_commands_parse_validate_and_take_keys() {
+        let config = Config::parse(
+            r##"
+            [keybindings]
+            split_right = "alt-s"
+
+            [[floating_commands]]
+            key = "alt-g"
+            command = "lazygit"
+
+            [[floating_commands]]
+            key = ["alt-y", "alt-s"] # alt-s is already split_right's
+            command = "htop -d 10"
+
+            [[floating_commands]]
+            key = "alt-entr"
+            command = "btop"
+
+            [[floating_commands]]
+            key = "alt-z"
+
+            [[floating_commands]]
+            command = "nokey"
+            "##,
+        );
+        // alt-s clash, bad key name, missing command, missing key.
+        assert_eq!(config.warnings.len(), 4, "{:?}", config.warnings);
+        assert!(config.warnings.iter().any(|w| w.contains("split_right keeps it")));
+        let commands: Vec<_> = config.floating_commands.iter().map(|f| (f.command.as_str(), f.keys.clone())).collect();
+        assert_eq!(
+            commands,
+            vec![
+                ("lazygit", vec!["alt-g".to_owned()]),
+                ("htop -d 10", vec!["alt-y".to_owned()]),
+                ("btop", vec![]),
+            ]
+        );
+        // A floating command (yours) beats a default binding on the same key.
+        let config = Config::parse("[[floating_commands]]\nkey = \"alt-t\"\ncommand = \"lazygit\"");
+        assert_eq!(config.floating_commands[0].keys, vec!["alt-t"]);
+        assert!(config.keys["new_tab"].is_empty());
+        assert_eq!(config.bindings().len(), ACTIONS.len()); // new_tab's lost, lazygit's added
     }
 
     #[test]

@@ -24,12 +24,14 @@ actions!(terminal, [Copy, Paste, CopyMode]);
 use crate::config::{Config, TermColors};
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum TerminalKind {
     /// A plain shell.
     Terminal,
     /// Helix running in the PTY.
     Editor,
+    /// A command like "lazygit", run through the user's shell.
+    Command(String),
 }
 
 /// Emitted once the process in the PTY has exited.
@@ -317,9 +319,16 @@ impl TerminalView {
             })
             .expect("failed to open pty");
 
-        let mut cmd = match kind {
+        let mut cmd = match &kind {
             TerminalKind::Editor => CommandBuilder::new("hx"),
             TerminalKind::Terminal => CommandBuilder::new_default_prog(),
+            TerminalKind::Command(command) => {
+                // A login + interactive shell loads the user's PATH (Homebrew,
+                // ~/.local/bin, ...) and aliases, and handles pipes and arguments.
+                let mut cmd = CommandBuilder::new(CommandBuilder::new_default_prog().get_shell());
+                cmd.args(["-l", "-i", "-c", command.as_str()]);
+                cmd
+            }
         };
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");

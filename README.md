@@ -107,9 +107,21 @@ new_tab = ["alt-t", "ctrl-shift-t"]
 toggle_floating = ""
 ```
 
+Floating terminals that run a command get a key each, e.g. lazygit on `Alt+G`:
+
+```toml
+[[floating_commands]]
+key = "alt-g"
+command = "lazygit"
+```
+
+Press the key to open it, again to hide / show it (it keeps running); it
+closes when the command exits. Add as many as you like. Commands run through
+your shell (`$SHELL -l -i -c`), so your `PATH`, aliases and arguments work.
+
 A key can belong to only one action. If two actions share a key, a key you set
 yourself wins over a default; between two of yours, the one listed first in
-`config.example.toml` keeps it.
+`config.example.toml` keeps it, then `[[floating_commands]]` in file order.
 
 Other files Vibe Term keeps:
 
@@ -160,8 +172,8 @@ Close a tab with the `×` on its title, or by closing its last container.
 | `Alt+Shift+F` | Float the focused container, or put the floating one back | `float_focused` |
 | `Alt+E` | Editor: open / focus its file explorer. Explorer: close it | `toggle_explorer` |
 
-Each tab has at most one floating terminal. Every other key goes to the
-focused terminal or editor.
+Each tab can have one floating shell (`Alt+F`) plus one per floating command;
+only one shows at a time. Every other key goes to the focused terminal or editor.
 
 ### Copy and paste (in a terminal)
 

@@ -38,6 +38,13 @@ actions!(
     ]
 );
 
+/// Open, show or hide the floating terminal of `[[floating_commands]]` entry `index`.
+#[derive(Clone, Debug, PartialEq, gpui::Action)]
+#[action(namespace = workspace, no_json)]
+pub struct RunFloatingCommand {
+    pub index: usize,
+}
+
 struct Tab {
     /// Stable label; positions change when tabs are moved.
     number: usize,
@@ -51,12 +58,40 @@ struct Tab {
     /// Container filling the whole tab; the split tree underneath is untouched,
     /// so un-maximizing restores the original layout.
     maximized: Option<EntityId>,
-    /// At most one terminal floating over the tab, outside the split tree.
-    floating: Option<Floating>,
+    /// Terminals floating over the tab, outside the split tree: at most one per
+    /// slot, and at most one visible.
+    floats: Vec<Floating>,
+}
+
+impl Tab {
+    fn visible_float(&self) -> Option<&Floating> {
+        self.floats.iter().find(|f| f.visible)
+    }
+
+    fn float_index(&self, id: EntityId) -> Option<usize> {
+        self.floats.iter().position(|f| f.terminal.entity_id() == id)
+    }
+
+    /// Show the float at `ix` (hiding the others), or hide all with `None`.
+    fn show_only(&mut self, ix: Option<usize>) {
+        for (i, float) in self.floats.iter_mut().enumerate() {
+            float.visible = Some(i) == ix;
+        }
+    }
+}
+
+/// What a floating terminal belongs to, i.e. which key toggles it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FloatSlot {
+    /// Alt+F's shell (and containers floated with Alt+Shift+F).
+    Shell,
+    /// Entry of `[[floating_commands]]` in the config.
+    Command(usize),
 }
 
 struct Floating {
     terminal: Entity<TerminalView>,
+    slot: FloatSlot,
     visible: bool,
     /// Its spot in the split tree, if it was floated out of it.
     home: Option<Placement>,
@@ -264,7 +299,7 @@ impl Workspace {
         tab.root
             .iter()
             .flat_map(|root| root.leaves())
-            .chain(tab.floating.as_ref().map(|f| &f.terminal))
+            .chain(tab.floats.iter().map(|f| &f.terminal))
             .find(|leaf| leaf.read(cx).focus_handle(cx) == focused)
             .map(|leaf| leaf.entity_id())
     }
@@ -273,12 +308,9 @@ impl Workspace {
     fn find_container(&self, id: EntityId) -> Option<Entity<TerminalView>> {
         let tab = self.tab();
         let tiled = tab.root.as_ref().and_then(|root| root.find_leaf(id.as_u64()));
-        tiled.cloned().or_else(|| {
-            tab.floating
-                .as_ref()
-                .filter(|f| f.terminal.entity_id() == id)
-                .map(|f| f.terminal.clone())
-        })
+        tiled
+            .or_else(|| tab.floats.iter().map(|f| &f.terminal).find(|t| t.entity_id() == id))
+            .cloned()
     }
 
     /// Whether `id` is tiled in the active tab (splitting/maximizing only apply there).
@@ -320,7 +352,7 @@ impl Workspace {
             self.empty_focus.focus(window);
             return;
         }
-        match self.tab().floating.as_ref().filter(|f| f.visible) {
+        match self.tab().visible_float() {
             Some(f) => f.terminal.read(cx).focus_handle(cx).focus(window),
             None => self.focus_tiled(window, cx),
         }
@@ -498,7 +530,7 @@ impl Workspace {
             explorers: HashMap::new(),
             last_focus: None,
             maximized: None,
-            floating: None,
+            floats: vec![],
         });
         project.next_tab_number += 1;
         let last = project.tabs.len() - 1;
@@ -524,7 +556,7 @@ impl Workspace {
             let tab = &mut project.tabs[0];
             tab.root = None;
             tab.explorers.clear();
-            tab.floating = None;
+            tab.floats.clear();
             tab.maximized = None;
             tab.last_focus = None;
         } else {
@@ -557,13 +589,10 @@ impl Workspace {
     /// Remove a container from whichever workspace/tab holds it. Removing a
     /// tab's last container closes the tab.
     fn remove_container(&mut self, id: EntityId, window: &mut Window, cx: &mut Context<Self>) {
-        let is_floating =
-            |t: &Tab| t.floating.as_ref().is_some_and(|f| f.terminal.entity_id() == id);
         let found = self.projects.iter().enumerate().find_map(|(p, project)| {
-            let t = project
-                .tabs
-                .iter()
-                .position(|t| t.root.as_ref().is_some_and(|r| r.contains(id.as_u64())) || is_floating(t))?;
+            let t = project.tabs.iter().position(|t| {
+                t.root.as_ref().is_some_and(|r| r.contains(id.as_u64())) || t.float_index(id).is_some()
+            })?;
             Some((p, t))
         });
         let Some((p, t)) = found else {
@@ -571,8 +600,9 @@ impl Workspace {
         };
         let was_focused = self.focused_id(window, cx) == Some(id);
         let tab = &mut self.projects[p].tabs[t];
-        if is_floating(tab) {
-            tab.floating = None;
+        if let Some(ix) = tab.float_index(id) {
+            // e.g. lazygit quit: its floating terminal goes away.
+            tab.floats.remove(ix);
             tab.explorers.remove(&id);
             if was_focused {
                 self.focus_tiled(window, cx);
@@ -581,16 +611,16 @@ impl Workspace {
             return;
         }
         if matches!(tab.root, Some(Node::Leaf(_))) {
-            // A floating terminal takes over the tab rather than dying with it.
-            let Some(floating) = tab.floating.take() else {
+            if tab.floats.is_empty() {
                 self.close_tab(p, t, window, cx);
                 return;
-            };
+            }
+            // Floating terminals keep the tab alive, over the empty-tab screen.
+            tab.root = None;
             tab.explorers.remove(&id);
             tab.maximized = None;
-            tab.root = Some(Node::Leaf(floating.terminal.clone()));
-            if was_focused || floating.visible {
-                floating.terminal.read(cx).focus_handle(cx).focus(window);
+            if was_focused {
+                self.focus_active_tab(window, cx);
             }
             cx.notify();
             return;
@@ -677,34 +707,65 @@ impl Workspace {
 
     // Floating -------------------------------------------------------------------
 
-    /// No floating terminal: create one. Otherwise show/hide it.
+    /// Alt+F: the tab's floating shell.
     fn toggle_floating(&mut self, _: &ToggleFloating, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_float(FloatSlot::Shell, window, cx);
+    }
+
+    /// A `[[floating_commands]]` key, e.g. Alt+G for lazygit.
+    fn run_floating_command(&mut self, action: &RunFloatingCommand, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_float(FloatSlot::Command(action.index), window, cx);
+    }
+
+    /// Show the slot's floating terminal (starting it if needed), or hide it if
+    /// it is the one showing. Only one is visible at a time.
+    fn toggle_float(&mut self, slot: FloatSlot, window: &mut Window, cx: &mut Context<Self>) {
         self.remember_focus(window, cx);
-        if self.tab().floating.is_none() {
-            let terminal = self.new_terminal(TerminalKind::Terminal, window, cx);
-            self.tab_mut().floating = Some(Floating {
-                terminal,
-                visible: true,
-                home: None,
-            });
-        } else if let Some(floating) = self.tab_mut().floating.as_mut() {
-            floating.visible = !floating.visible;
+        match self.tab().floats.iter().position(|f| f.slot == slot) {
+            Some(ix) => {
+                let tab = self.tab_mut();
+                let show = !tab.floats[ix].visible;
+                tab.show_only(show.then_some(ix));
+            }
+            None => {
+                let kind = match slot {
+                    FloatSlot::Shell => TerminalKind::Terminal,
+                    FloatSlot::Command(index) => {
+                        let commands = &cx.global::<Config>().floating_commands;
+                        let Some(command) = commands.get(index) else {
+                            return;
+                        };
+                        TerminalKind::Command(command.command.clone())
+                    }
+                };
+                let terminal = self.new_terminal(kind, window, cx);
+                let tab = self.tab_mut();
+                tab.floats.push(Floating {
+                    terminal,
+                    slot,
+                    visible: false,
+                    home: None,
+                });
+                tab.show_only(Some(tab.floats.len() - 1));
+            }
         }
         self.focus_active_tab(window, cx);
         cx.notify();
     }
 
-    /// Float the focused tiled container, or put the floating one back.
+    /// Float the focused tiled container, or put a floating one back.
     fn float_focused(&mut self, _: &FloatFocused, window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.focused_id(window, cx) else {
             return;
         };
-        if !self.is_tiled(id) {
-            self.dock_floating(window, cx);
+        if let Some(ix) = self.tab().float_index(id) {
+            self.dock_float(ix, window, cx);
             return;
         }
-        // One floating terminal per tab: the current one goes back first.
-        self.dock_floating(window, cx);
+        // It takes the Alt+F slot: whatever floats there goes back first.
+        if let Some(ix) = self.tab().floats.iter().position(|f| f.slot == FloatSlot::Shell) {
+            self.dock_float(ix, window, cx);
+        }
         let tab = self.tab_mut();
         let Some(root) = tab.root.as_mut() else {
             return;
@@ -719,22 +780,22 @@ impl Workspace {
         if tab.maximized == Some(id) {
             tab.maximized = None;
         }
-        tab.floating = Some(Floating {
+        tab.floats.push(Floating {
             terminal,
-            visible: true,
+            slot: FloatSlot::Shell,
+            visible: false,
             home,
         });
+        tab.show_only(Some(tab.floats.len() - 1));
         self.focus_active_tab(window, cx);
         cx.notify();
     }
 
-    /// Put the floating terminal back into the split tree: where it came from if
+    /// Put a floating terminal back into the split tree: where it came from if
     /// that spot still exists, else on the right edge.
-    fn dock_floating(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn dock_float(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let tab = self.tab_mut();
-        let Some(floating) = tab.floating.take() else {
-            return;
-        };
+        let floating = tab.floats.remove(ix);
         let terminal = floating.terminal.clone();
         let restored = match (tab.root.as_mut(), floating.home.as_ref()) {
             (Some(root), Some(home)) => root.restore(home, terminal.clone()),
@@ -976,7 +1037,7 @@ impl Workspace {
         let containers: usize = project
             .tabs
             .iter()
-            .map(|tab| tab.root.as_ref().map_or(0, |root| root.leaves().len()) + tab.floating.is_some() as usize)
+            .map(|tab| tab.root.as_ref().map_or(0, |root| root.leaves().len()) + tab.floats.len())
             .sum();
         let detail = match containers {
             0 => "Nothing is running in it.".to_owned(),
@@ -1168,7 +1229,7 @@ impl Workspace {
                             }
                         }
                     })
-                    .when_some(tab.floating.as_ref().filter(|f| f.visible), |el, floating| {
+                    .when_some(tab.visible_float(), |el, floating| {
                         el.child(
                             div()
                                 .id("floating")
@@ -1318,6 +1379,7 @@ impl Render for Workspace {
                     .on_action(cx.listener(Self::prev_tab))
                     .on_action(cx.listener(Self::toggle_maximize))
                     .on_action(cx.listener(Self::toggle_floating))
+                    .on_action(cx.listener(Self::run_floating_command))
                     .on_action(cx.listener(Self::float_focused))
             })
             .child(self.render_sidebar(cx))
