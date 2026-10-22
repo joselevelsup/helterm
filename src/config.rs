@@ -132,6 +132,7 @@ const ACTIONS: &[(&str, &str, fn() -> Box<dyn Action>)] = &[
     ("float_focused", "alt-shift-f", || Box::new(FloatFocused)),
     ("copy", "ctrl-shift-c", || Box::new(crate::terminal::Copy)),
     ("paste", "ctrl-shift-v", || Box::new(crate::terminal::Paste)),
+    ("copy_mode", "alt-v", || Box::new(crate::terminal::CopyMode)),
 ];
 
 pub struct Config {

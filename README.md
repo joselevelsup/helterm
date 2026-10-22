@@ -164,11 +164,35 @@ focused terminal or editor.
 | Drag | Select text (double-click: a word, triple-click: a line) | |
 | `Ctrl+Shift+C` | Copy the selection | `copy` |
 | `Ctrl+Shift+V` | Paste | `paste` |
+| `Alt+V` | Toggle copy mode (see below) | `copy_mode` |
 | Middle-click | Paste the last selection (Linux "primary" clipboard) | |
 
 Selecting also fills the middle-click clipboard. Clicking or typing clears the
 selection. Pastes into programs that support it (shells, Helix) are bracketed,
 so multi-line pastes don't run line by line.
+
+### Scrolling and copy mode (in a terminal)
+
+The mouse wheel / touchpad scrolls back through the terminal's history (10,000
+lines). In full-screen programs like Helix or `less` it sends arrow keys
+instead. A badge in the corner shows where you are (`12/340`, like tmux); typing
+jumps back to the bottom.
+
+`Alt+V` (`copy_mode`) toggles a tmux-style vi copy mode. Its keys never reach the
+program:
+
+| Keys | Action |
+| ---- | ------ |
+| `j` / `k`, `↓` / `↑` | Move down / up (scrolls through history) |
+| `h` / `l`, `w` / `b` / `e`, `W` / `B` / `E` | Move left / right, by word |
+| `0` / `^` / `$` | Start / first character / end of line |
+| `H` / `M` / `L` | Top / middle / bottom of the screen |
+| `g` / `G` | Top of history / bottom |
+| `Ctrl+U` / `Ctrl+D` | Half a screen up / down |
+| `Ctrl+B` / `Ctrl+F`, `PageUp` / `PageDown` | A screen up / down |
+| `v` / `V` | Start (or cancel) a character / line selection |
+| `y` / `Enter` | Copy the selection and leave copy mode |
+| `q` / `Esc` | Leave copy mode |
 
 ### File explorer (when focused)
 

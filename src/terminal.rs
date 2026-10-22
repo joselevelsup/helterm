@@ -4,21 +4,23 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener};
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::index::{Column, Line, Point as GridPoint, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::{Config as TermConfig, RenderableContent, Term, TermMode};
+use alacritty_terminal::vi_mode::ViMotion;
 use alacritty_terminal::vte::ansi::{Color as VteColor, CursorShape, Processor, Rgb};
 use gpui::{
     actions, relative, rgb, App, Bounds, ClipboardItem, Context, Element, ElementId, Entity,
     EventEmitter, FocusHandle, Focusable, Font, FontStyle, FontWeight, GlobalElementId, Hsla,
     IntoElement, KeyDownEvent, Keystroke, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Render, ShapedLine, SharedString, Size, StrikethroughStyle, Style,
+    MouseUpEvent, Pixels, Render, ScrollDelta, ScrollWheelEvent, ShapedLine, SharedString, Size,
+    StrikethroughStyle, Style,
     TextRun, UnderlineStyle, Window, div, point, prelude::*, px, size,
 };
 
-actions!(terminal, [Copy, Paste]);
+actions!(terminal, [Copy, Paste, CopyMode]);
 use crate::config::{Config, TermColors};
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 
@@ -125,6 +127,8 @@ pub struct TerminalView {
     cell_size: Size<Pixels>,
     /// A mouse-drag selection is in progress.
     selecting: bool,
+    /// Fraction of a line left over from smooth (touchpad) scrolling.
+    scroll_remainder: f32,
 }
 
 impl EventEmitter<Exited> for TerminalView {}
@@ -137,6 +141,93 @@ fn cell_at(x: f32, y: f32, cell: (f32, f32), grid: (usize, usize)) -> (usize, us
     let column = (col as usize).min(cols.saturating_sub(1));
     let side = if col as usize >= cols || col.fract() >= 0.5 { Side::Right } else { Side::Left };
     (column, (row as usize).min(rows.saturating_sub(1)), side)
+}
+
+/// What a key did in copy mode.
+#[derive(Debug, PartialEq)]
+enum CopyModeKey {
+    Handled,
+    /// Copy this text (if anything is selected) and leave copy mode.
+    Yank(Option<String>),
+    Exit,
+    Ignored,
+}
+
+/// tmux/vi-style copy mode on top of alacritty's vi mode: keys move a cursor
+/// through the scrollback (the view follows it), `v`/`V` select, `y` copies.
+fn copy_mode_key<T: EventListener>(term: &mut Term<T>, ks: &Keystroke) -> CopyModeKey {
+    let ctrl = ks.modifiers.control;
+    // Prefer the typed character ("G", "$"); fall back to the key name.
+    let key = match ks.key_char.as_deref() {
+        Some(typed) if !ctrl => typed.to_owned(),
+        _ if ks.modifiers.shift && ks.key.chars().count() == 1 => ks.key.to_uppercase(),
+        _ => ks.key.clone(),
+    };
+    let half_page = (term.screen_lines() / 2).max(1) as i32;
+    let motion = match (ctrl, key.as_str()) {
+        (false, "j" | "J" | "down") => Some(ViMotion::Down),
+        (false, "k" | "K" | "up") => Some(ViMotion::Up),
+        (false, "h" | "left") => Some(ViMotion::Left),
+        (false, "l" | "right") => Some(ViMotion::Right),
+        (false, "w") => Some(ViMotion::SemanticRight),
+        (false, "b") => Some(ViMotion::SemanticLeft),
+        (false, "e") => Some(ViMotion::SemanticRightEnd),
+        (false, "W") => Some(ViMotion::WordRight),
+        (false, "B") => Some(ViMotion::WordLeft),
+        (false, "E") => Some(ViMotion::WordRightEnd),
+        (false, "0" | "home") => Some(ViMotion::First),
+        (false, "$" | "end") => Some(ViMotion::Last),
+        (false, "^") => Some(ViMotion::FirstOccupied),
+        (false, "H") => Some(ViMotion::High),
+        (false, "M") => Some(ViMotion::Middle),
+        (false, "L") => Some(ViMotion::Low),
+        _ => None,
+    };
+    if let Some(motion) = motion {
+        term.vi_motion(motion);
+        let point = term.vi_mode_cursor.point;
+        term.scroll_to_point(point);
+        return CopyModeKey::Handled;
+    }
+    let scroll = match (ctrl, key.as_str()) {
+        (true, "u") => Some(Scroll::Delta(half_page)),
+        (true, "d") => Some(Scroll::Delta(-half_page)),
+        (true, "b") | (false, "pageup") => Some(Scroll::PageUp),
+        (true, "f") | (false, "pagedown") => Some(Scroll::PageDown),
+        (true, "y") => Some(Scroll::Delta(1)),
+        (true, "e") => Some(Scroll::Delta(-1)),
+        _ => None,
+    };
+    if let Some(scroll) = scroll {
+        // Keeps the vi cursor inside the view, as tmux does.
+        term.scroll_display(scroll);
+        return CopyModeKey::Handled;
+    }
+    match (ctrl, key.as_str()) {
+        (false, "g") => {
+            let top = GridPoint::new(term.topmost_line(), Column(0));
+            term.vi_goto_point(top);
+        }
+        (false, "G") => {
+            let bottom = GridPoint::new(term.bottommost_line(), Column(0));
+            term.vi_goto_point(bottom);
+        }
+        (false, "v" | "V") => {
+            let ty = if key == "V" { SelectionType::Lines } else { SelectionType::Simple };
+            if term.selection.as_ref().is_some_and(|s| s.ty == ty) {
+                term.selection = None; // pressing it again cancels, like vim
+            } else {
+                let mut selection = Selection::new(ty, term.vi_mode_cursor.point, Side::Left);
+                // An empty selection would not grow as the cursor moves.
+                selection.include_all();
+                term.selection = Some(selection);
+            }
+        }
+        (false, "y" | "enter") => return CopyModeKey::Yank(term.selection_to_string()),
+        (false, "escape" | "q") | (true, "c") => return CopyModeKey::Exit,
+        _ => return CopyModeKey::Ignored,
+    }
+    CopyModeKey::Handled
 }
 
 /// Bytes a paste sends to the program.
@@ -246,6 +337,7 @@ impl TerminalView {
             grid_origin: gpui::Point::default(),
             cell_size: Size::default(),
             selecting: false,
+            scroll_remainder: 0.,
         }
     }
 
@@ -304,6 +396,57 @@ impl TerminalView {
         // Linux convention: selecting copies to the PRIMARY selection (middle-click paste).
         if let Some(text) = self.selected_text() {
             cx.write_to_primary(ClipboardItem::new_string(text));
+        }
+    }
+
+    fn in_copy_mode(&self) -> bool {
+        self.term.mode().contains(TermMode::VI)
+    }
+
+    fn toggle_copy_mode(&mut self, _: &CopyMode, _: &mut Window, cx: &mut Context<Self>) {
+        if self.in_copy_mode() {
+            self.exit_copy_mode();
+        } else {
+            self.term.selection = None;
+            self.term.toggle_vi_mode();
+        }
+        cx.notify();
+    }
+
+    fn exit_copy_mode(&mut self) {
+        if self.in_copy_mode() {
+            self.term.toggle_vi_mode();
+        }
+        self.term.selection = None;
+        self.term.scroll_display(Scroll::Bottom);
+    }
+
+    /// Wheel/touchpad: scroll the history. Full-screen programs (Helix, less)
+    /// have no history, so they get arrow keys instead, like Alacritty does.
+    fn scroll_wheel(&mut self, event: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let line_height = self.cell_size.height / px(1.);
+        if line_height <= 0. {
+            return;
+        }
+        self.scroll_remainder += match event.delta {
+            ScrollDelta::Lines(delta) => delta.y * 3.,
+            ScrollDelta::Pixels(delta) => delta.y / px(1.) / line_height,
+        };
+        let lines = self.scroll_remainder.trunc();
+        self.scroll_remainder -= lines;
+        let lines = lines as i32;
+        if lines == 0 {
+            return;
+        }
+        let mode = *self.term.mode();
+        if mode.contains(TermMode::ALT_SCREEN) && !mode.contains(TermMode::VI) {
+            if mode.contains(TermMode::ALTERNATE_SCROLL) {
+                let arrow: &[u8] = if lines > 0 { b"\x1b[A" } else { b"\x1b[B" };
+                self.write(&arrow.repeat(lines.unsigned_abs() as usize));
+            }
+        } else {
+            self.term.scroll_display(Scroll::Delta(lines));
+            cx.notify();
         }
     }
 
@@ -738,6 +881,17 @@ impl Element for TerminalElement {
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let focused = self.focus_handle.is_focused(window);
+        // Where we are in the history, like tmux's [12/340]; only when not at the bottom.
+        let grid = self.term.grid();
+        let (offset, history) = (grid.display_offset(), grid.history_size());
+        let badge = match self.in_copy_mode() {
+            true => Some(format!("COPY  {offset}/{history}")),
+            false => (offset > 0).then(|| format!("{offset}/{history}")),
+        };
+        let (badge_bg, badge_fg) = {
+            let ui = cx.global::<Config>().ui;
+            (ui.accent, ui.background)
+        };
         let config = cx.global::<Config>();
         let (family, size) = (config.font_family.clone(), config.font_size);
         let (background, border) = (
@@ -759,10 +913,31 @@ impl Render for TerminalView {
             .on_mouse_down(MouseButton::Middle, cx.listener(Self::paste_primary))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::paste))
+            .on_action(cx.listener(Self::toggle_copy_mode))
+            .on_scroll_wheel(cx.listener(Self::scroll_wheel))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+                if this.in_copy_mode() {
+                    // Copy mode keys never reach the program.
+                    match copy_mode_key(&mut this.term, &event.keystroke) {
+                        CopyModeKey::Ignored => return,
+                        CopyModeKey::Handled => {}
+                        CopyModeKey::Yank(text) => {
+                            if let Some(text) = text.filter(|t| !t.is_empty()) {
+                                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                            }
+                            this.exit_copy_mode();
+                        }
+                        CopyModeKey::Exit => this.exit_copy_mode(),
+                    }
+                    cx.notify();
+                    return;
+                }
                 if let Some(bytes) = keystroke_to_bytes(&event.keystroke) {
-                    // Typing clears the selection, like other terminals.
-                    if this.term.selection.take().is_some() {
+                    // Typing clears the selection and jumps back to the bottom,
+                    // like other terminals.
+                    let scrolled = this.term.grid().display_offset() != 0;
+                    if this.term.selection.take().is_some() || scrolled {
+                        this.term.scroll_display(Scroll::Bottom);
                         cx.notify();
                     }
                     this.write(&bytes);
@@ -777,7 +952,23 @@ impl Render for TerminalView {
             .rounded_md()
             // Inner padding between the border and the text; the grid shrinks to fit.
             .p(px(6.))
+            .relative()
             .child(TerminalElement { view: cx.entity() })
+            .when_some(badge, |el, badge| {
+                el.child(
+                    div()
+                        .absolute()
+                        .top(px(4.))
+                        .right(px(8.))
+                        .px_2()
+                        .rounded_sm()
+                        .bg(rgb(badge_bg))
+                        .text_color(rgb(badge_fg))
+                        .text_size(px(11.))
+                        .line_height(px(16.))
+                        .child(badge),
+                )
+            })
     }
 }
 
@@ -869,6 +1060,69 @@ mod tests {
         // A plain click selects nothing.
         term.selection = Some(Selection::new(SelectionType::Simple, at(0, 3), Side::Left));
         assert_eq!(term.selection_to_string().filter(|s| !s.is_empty()), None);
+    }
+
+    fn term_with_lines(lines: usize) -> Term<PtyListener> {
+        let mut term = Term::new(
+            TermConfig::default(),
+            &Dims { cols: 20, rows: 5 },
+            PtyListener {
+                writer: Arc::new(Mutex::new(Box::new(std::io::sink()))),
+                colors: TermColors::default(),
+            },
+        );
+        let mut parser: Processor = Processor::new();
+        let text: String = (0..lines).map(|i| format!("line {i}\r\n")).collect();
+        for b in text.as_bytes() {
+            parser.advance(&mut term, *b);
+        }
+        term
+    }
+
+    fn press(term: &mut Term<PtyListener>, key: &str) -> CopyModeKey {
+        copy_mode_key(term, &Keystroke::parse(key).unwrap())
+    }
+
+    #[test]
+    fn copy_mode_scrolls_selects_and_yanks() {
+        let mut term = term_with_lines(30);
+        term.toggle_vi_mode();
+        assert_eq!(term.grid().display_offset(), 0);
+
+        // k walks up past the top of the screen: the view follows into history.
+        for _ in 0..10 {
+            assert_eq!(press(&mut term, "k"), CopyModeKey::Handled);
+        }
+        assert!(term.grid().display_offset() > 0);
+
+        // g: top of history, G: back to the bottom.
+        press(&mut term, "g");
+        assert_eq!(term.grid().display_offset(), term.grid().history_size());
+        press(&mut term, "shift-g");
+        assert_eq!(term.grid().display_offset(), 0);
+
+        // Go to "line 3", select two whole lines, yank.
+        press(&mut term, "g");
+        for _ in 0..3 {
+            press(&mut term, "j");
+        }
+        press(&mut term, "V->V");
+        press(&mut term, "j");
+        assert_eq!(
+            press(&mut term, "y"),
+            CopyModeKey::Yank(Some("line 3\nline 4\n".to_owned()))
+        );
+
+        // Ctrl+U / Ctrl+D scroll by half a screen.
+        press(&mut term, "shift-g");
+        press(&mut term, "ctrl-u");
+        assert_eq!(term.grid().display_offset(), 2);
+        press(&mut term, "ctrl-d");
+        assert_eq!(term.grid().display_offset(), 0);
+
+        assert_eq!(press(&mut term, "x"), CopyModeKey::Ignored);
+        assert_eq!(press(&mut term, "q"), CopyModeKey::Exit);
+        assert_eq!(press(&mut term, "escape"), CopyModeKey::Exit);
     }
 
     #[test]

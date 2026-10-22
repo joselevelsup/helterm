@@ -70,3 +70,4 @@ toggle_floating = "alt-f"
 float_focused = "alt-shift-f"
 copy = "ctrl-shift-c"   # copy the selection (selecting also fills the middle-click clipboard)
 paste = "ctrl-shift-v"
+copy_mode = "alt-v"      # tmux-style: j/k scroll, v/V select, y copy, q/Esc leave
