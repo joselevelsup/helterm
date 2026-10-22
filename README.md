@@ -192,9 +192,11 @@ so multi-line pastes don't run line by line.
 ### Scrolling and copy mode (in a terminal)
 
 The mouse wheel / touchpad scrolls back through the terminal's history (10,000
-lines). In full-screen programs like Helix or `less` it sends arrow keys
-instead. A badge in the corner shows where you are (`12/340`, like tmux); typing
-jumps back to the bottom.
+lines), like any terminal. Programs that handle the mouse themselves (Pi's
+fullscreen mode, Helix, htop, ...) get the wheel events and scroll their own
+view; full-screen programs without mouse support (`less`, `man`) get arrow
+keys. A badge in the corner shows where you are in the history (`12/340`, like
+tmux); typing jumps back to the bottom.
 
 `Alt+V` (`copy_mode`) toggles a tmux-style copy mode with **Helix keys**. Like
 Helix there is a normal mode (moving drops the selection) and a select mode

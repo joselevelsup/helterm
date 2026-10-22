@@ -297,6 +297,57 @@ fn copy_mode_key<T: EventListener>(term: &mut Term<T>, state: &mut CopyModeState
     CopyModeKey::Handled
 }
 
+/// What a mouse-wheel step does.
+#[derive(Debug, PartialEq)]
+enum Wheel {
+    /// Move our own view through the scrollback.
+    ScrollHistory,
+    /// Send these bytes to the program (may be empty: nothing to do).
+    Send(Vec<u8>),
+}
+
+/// Decide what `lines` wheel steps (positive = up) at viewport cell
+/// (`column`, `row`) mean for the program, like Alacritty does.
+fn wheel_input(mode: TermMode, lines: i32, column: usize, row: usize, mods: &gpui::Modifiers) -> Wheel {
+    let steps = lines.unsigned_abs() as usize;
+    if mode.contains(TermMode::VI) {
+        return Wheel::ScrollHistory; // copy mode scrolls our own view
+    }
+    if mode.intersects(TermMode::MOUSE_MODE) {
+        // The program handles the mouse itself (Pi, Helix, htop...): report
+        // wheel buttons 64 (up) / 65 (down), with modifier bits.
+        let mut button = if lines > 0 { 64 } else { 65 };
+        button += 4 * mods.shift as u32 + 8 * mods.alt as u32 + 16 * mods.control as u32;
+        let report = if mode.contains(TermMode::SGR_MOUSE) {
+            format!("\x1b[<{button};{};{}M", column + 1, row + 1).into_bytes()
+        } else {
+            // Legacy encoding: each value offset by 32; UTF-8 mode widens the range.
+            let encode = |value: usize| -> Option<Vec<u8>> {
+                let value = 32 + 1 + value;
+                if mode.contains(TermMode::UTF8_MOUSE) {
+                    char::from_u32(value as u32).map(|c| c.to_string().into_bytes())
+                } else {
+                    u8::try_from(value).ok().map(|b| vec![b])
+                }
+            };
+            match (encode(column), encode(row)) {
+                (Some(col), Some(row)) => [b"\x1b[M".to_vec(), vec![32 + button as u8], col, row].concat(),
+                _ => return Wheel::Send(vec![]), // too far right/down for this encoding
+            }
+        };
+        return Wheel::Send(report.repeat(steps));
+    }
+    if mode.contains(TermMode::ALT_SCREEN) {
+        // Full screen without mouse support (less, man): arrow keys, if allowed.
+        if !mode.contains(TermMode::ALTERNATE_SCROLL) {
+            return Wheel::Send(vec![]);
+        }
+        let arrow: &[u8] = if lines > 0 { b"\x1b[A" } else { b"\x1b[B" };
+        return Wheel::Send(arrow.repeat(steps));
+    }
+    Wheel::ScrollHistory
+}
+
 /// Bytes a paste sends to the program.
 fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
     if bracketed {
@@ -506,7 +557,8 @@ impl TerminalView {
             return;
         }
         self.scroll_remainder += match event.delta {
-            ScrollDelta::Lines(delta) => delta.y * 3.,
+            // gpui already counts a wheel notch as 3 lines.
+            ScrollDelta::Lines(delta) => delta.y,
             ScrollDelta::Pixels(delta) => delta.y / px(1.) / line_height,
         };
         let lines = self.scroll_remainder.trunc();
@@ -515,15 +567,15 @@ impl TerminalView {
         if lines == 0 {
             return;
         }
-        let mode = *self.term.mode();
-        if mode.contains(TermMode::ALT_SCREEN) && !mode.contains(TermMode::VI) {
-            if mode.contains(TermMode::ALTERNATE_SCROLL) {
-                let arrow: &[u8] = if lines > 0 { b"\x1b[A" } else { b"\x1b[B" };
-                self.write(&arrow.repeat(lines.unsigned_abs() as usize));
+        let (point, _) = self.grid_point(event.position);
+        let row = (point.line.0 + self.term.grid().display_offset() as i32).max(0) as usize;
+        match wheel_input(*self.term.mode(), lines, point.column.0, row, &event.modifiers) {
+            Wheel::ScrollHistory => {
+                self.term.scroll_display(Scroll::Delta(lines));
+                cx.notify();
             }
-        } else {
-            self.term.scroll_display(Scroll::Delta(lines));
-            cx.notify();
+            Wheel::Send(bytes) if !bytes.is_empty() => self.write(&bytes),
+            Wheel::Send(_) => {}
         }
     }
 
@@ -1095,6 +1147,46 @@ mod tests {
         // Outside the grid clamps to the edges (drags past the pane).
         assert_eq!(cell_at(-50., -50., cell, (80, 24)), (0, 0, Side::Left));
         assert_eq!(cell_at(5000., 5000., cell, (80, 24)), (79, 23, Side::Right));
+    }
+
+    #[test]
+    fn wheel_goes_where_the_program_wants_it() {
+        let none = gpui::Modifiers::default();
+        let shell = TermMode::default();
+        let full_screen = shell | TermMode::ALT_SCREEN;
+        let with_mouse = full_screen | TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_DRAG;
+
+        // Plain shell: scroll our own history.
+        assert_eq!(wheel_input(shell, 3, 0, 0, &none), Wheel::ScrollHistory);
+        // less/man (full screen, no mouse): arrow keys, one per line.
+        assert_eq!(wheel_input(full_screen, 2, 0, 0, &none), Wheel::Send(b"\x1b[A\x1b[A".to_vec()));
+        assert_eq!(wheel_input(full_screen, -1, 0, 0, &none), Wheel::Send(b"\x1b[B".to_vec()));
+        assert_eq!(
+            wheel_input(full_screen - TermMode::ALTERNATE_SCROLL, 1, 0, 0, &none),
+            Wheel::Send(vec![])
+        );
+        // Pi / Helix (mouse reporting, SGR): wheel buttons 64/65 at the 1-based cell.
+        assert_eq!(
+            wheel_input(with_mouse | TermMode::SGR_MOUSE, 2, 9, 4, &none),
+            Wheel::Send(b"\x1b[<64;10;5M\x1b[<64;10;5M".to_vec())
+        );
+        let ctrl = gpui::Modifiers { control: true, ..Default::default() };
+        assert_eq!(
+            wheel_input(with_mouse | TermMode::SGR_MOUSE, -1, 0, 0, &ctrl),
+            Wheel::Send(b"\x1b[<81;1;1M".to_vec())
+        );
+        // Mouse reporting even works outside full screen.
+        assert_eq!(
+            wheel_input(shell | TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE, 1, 0, 0, &none),
+            Wheel::Send(b"\x1b[<64;1;1M".to_vec())
+        );
+        // Legacy encoding: 32 + button, 32 + 1 + column, 32 + 1 + row.
+        assert_eq!(wheel_input(with_mouse, 1, 9, 4, &none), Wheel::Send(vec![0x1b, b'[', b'M', 96, 42, 37]));
+        assert_eq!(wheel_input(with_mouse, 1, 300, 4, &none), Wheel::Send(vec![])); // too wide
+        let utf8 = with_mouse | TermMode::UTF8_MOUSE;
+        assert_eq!(wheel_input(utf8, 1, 300, 4, &none), Wheel::Send("\x1b[M`ō%".as_bytes().to_vec()));
+        // Copy mode always scrolls our view.
+        assert_eq!(wheel_input(with_mouse | TermMode::VI, 1, 0, 0, &none), Wheel::ScrollHistory);
     }
 
     #[test]
