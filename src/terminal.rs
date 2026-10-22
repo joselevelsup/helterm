@@ -6,14 +6,19 @@ use std::sync::{Arc, Mutex};
 use alacritty_terminal::event::{Event as TermEvent, EventListener};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::{Config as TermConfig, RenderableContent, Term};
+use alacritty_terminal::index::{Column, Line, Point as GridPoint, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
+use alacritty_terminal::term::{Config as TermConfig, RenderableContent, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color as VteColor, CursorShape, Processor, Rgb};
 use gpui::{
-    relative, rgb, App, Bounds, Context, Element, ElementId, Entity, EventEmitter, FocusHandle,
-    Focusable, Font, FontStyle, FontWeight, GlobalElementId, Hsla, IntoElement, KeyDownEvent,
-    Keystroke, LayoutId, MouseDownEvent, Pixels, Render, ShapedLine, SharedString,
-    StrikethroughStyle, Style, TextRun, UnderlineStyle, Window, div, point, prelude::*, px, size,
+    actions, relative, rgb, App, Bounds, ClipboardItem, Context, Element, ElementId, Entity,
+    EventEmitter, FocusHandle, Focusable, Font, FontStyle, FontWeight, GlobalElementId, Hsla,
+    IntoElement, KeyDownEvent, Keystroke, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Render, ShapedLine, SharedString, Size, StrikethroughStyle, Style,
+    TextRun, UnderlineStyle, Window, div, point, prelude::*, px, size,
 };
+
+actions!(terminal, [Copy, Paste]);
 use crate::config::{Config, TermColors};
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 
@@ -115,9 +120,35 @@ pub struct TerminalView {
     parser: Processor,
     cols: usize,
     rows: usize,
+    /// Where the grid was last painted, to map mouse positions to cells.
+    grid_origin: gpui::Point<Pixels>,
+    cell_size: Size<Pixels>,
+    /// A mouse-drag selection is in progress.
+    selecting: bool,
 }
 
 impl EventEmitter<Exited> for TerminalView {}
+
+/// Cell under a position measured from the grid's top-left corner, plus which
+/// half of the cell it is on. Positions outside the grid clamp to its edges.
+fn cell_at(x: f32, y: f32, cell: (f32, f32), grid: (usize, usize)) -> (usize, usize, Side) {
+    let (col, row) = (x.max(0.) / cell.0, y.max(0.) / cell.1);
+    let (cols, rows) = grid;
+    let column = (col as usize).min(cols.saturating_sub(1));
+    let side = if col as usize >= cols || col.fract() >= 0.5 { Side::Right } else { Side::Left };
+    (column, (row as usize).min(rows.saturating_sub(1)), side)
+}
+
+/// Bytes a paste sends to the program.
+fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    if bracketed {
+        // Drop ESC so pasted text can't end the paste early and run as commands.
+        format!("\x1b[200~{}\x1b[201~", text.replace('\x1b', "")).into_bytes()
+    } else {
+        // Without bracketed paste, newlines are typed as Enter, like other terminals.
+        text.replace("\r\n", "\r").replace('\n', "\r").into_bytes()
+    }
+}
 
 impl TerminalView {
     pub fn new(kind: TerminalKind, cwd: PathBuf, cx: &mut Context<Self>) -> Self {
@@ -212,6 +243,9 @@ impl TerminalView {
             parser: Processor::new(),
             cols: 80,
             rows: 24,
+            grid_origin: gpui::Point::default(),
+            cell_size: Size::default(),
+            selecting: false,
         }
     }
 
@@ -219,6 +253,88 @@ impl TerminalView {
         for b in bytes {
             self.parser.advance(&mut self.term, *b);
         }
+    }
+
+    fn grid_point(&self, position: gpui::Point<Pixels>) -> (GridPoint, Side) {
+        let grid = self.term.grid();
+        let offset = position - self.grid_origin;
+        let cell = (self.cell_size.width / px(1.), self.cell_size.height / px(1.));
+        if cell.0 <= 0. || cell.1 <= 0. {
+            return (GridPoint::new(Line(0), Column(0)), Side::Left); // not painted yet
+        }
+        let (column, row, side) = cell_at(
+            offset.x / px(1.),
+            offset.y / px(1.),
+            cell,
+            (grid.columns(), grid.screen_lines()),
+        );
+        let line = Line(row as i32 - grid.display_offset() as i32);
+        (GridPoint::new(line, Column(column)), side)
+    }
+
+    /// Click starts a selection: 1 click by character, 2 by word, 3 by line.
+    fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_handle.focus(window);
+        let (point, side) = self.grid_point(event.position);
+        let ty = match event.click_count {
+            2 => SelectionType::Semantic,
+            n if n >= 3 => SelectionType::Lines,
+            _ => SelectionType::Simple,
+        };
+        self.term.selection = Some(Selection::new(ty, point, side));
+        self.selecting = true;
+        cx.notify();
+    }
+
+    fn mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.selecting || event.pressed_button != Some(MouseButton::Left) {
+            return;
+        }
+        let (point, side) = self.grid_point(event.position);
+        if let Some(selection) = self.term.selection.as_mut() {
+            selection.update(point, side);
+            cx.notify();
+        }
+    }
+
+    fn mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if !std::mem::take(&mut self.selecting) {
+            return;
+        }
+        // Linux convention: selecting copies to the PRIMARY selection (middle-click paste).
+        if let Some(text) = self.selected_text() {
+            cx.write_to_primary(ClipboardItem::new_string(text));
+        }
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        self.term.selection_to_string().filter(|text| !text.is_empty())
+    }
+
+    fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(text) = self.selected_text() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            self.paste_text(&text, cx);
+        }
+    }
+
+    fn paste_primary(&mut self, _: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_handle.focus(window);
+        if let Some(text) = cx.read_from_primary().and_then(|item| item.text()) {
+            self.paste_text(&text, cx);
+        }
+    }
+
+    fn paste_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.term.selection = None;
+        let bracketed = self.term.mode().contains(TermMode::BRACKETED_PASTE);
+        self.write(&paste_bytes(text, bracketed));
+        cx.notify();
     }
 
     pub fn write(&self, bytes: &[u8]) {
@@ -502,8 +618,10 @@ impl Element for TerminalElement {
             display_iter,
             cursor,
             display_offset,
+            selection,
             ..
         } = term.renderable_content();
+        let selection_bg: Hsla = rgb(colors.selection).into();
         let columns = term.grid().columns();
         let screen_lines = term.grid().screen_lines();
 
@@ -515,7 +633,10 @@ impl Element for TerminalElement {
         let mut col = 0usize;
 
         for cell in display_iter {
-            let cell_style = CellStyle::of(&cell, &colors);
+            let mut cell_style = CellStyle::of(&cell, &colors);
+            if selection.is_some_and(|s| s.contains(cell.point)) {
+                cell_style.bg = Some(selection_bg);
+            }
             if cur != Some(cell_style) {
                 if let Some(prev) = cur.filter(|_| row_text.len() > run_start) {
                     row_runs.push(prev.run(row_text.len() - run_start, &font));
@@ -577,16 +698,14 @@ impl Element for TerminalElement {
         // Resize the terminal to fit the available bounds.
         let cols = ((bounds.size.width / cell_width).floor() as usize).max(1);
         let rows = ((bounds.size.height / line_height).floor() as usize).max(1);
-        let needs_resize = {
-            let view = self.view.read(cx);
-            view.cols != cols || view.rows != rows
-        };
-        if needs_resize {
-            self.view.update(cx, |view, cx| {
+        self.view.update(cx, |view, cx| {
+            view.grid_origin = bounds.origin;
+            view.cell_size = size(cell_width, line_height);
+            if view.cols != cols || view.rows != rows {
                 view.resize(cols, rows);
                 cx.notify();
-            });
-        }
+            }
+        });
 
         // Backgrounds are a separate pass in gpui; all of them go under all text.
         for (i, line) in prepaint.rows.iter().enumerate() {
@@ -633,14 +752,19 @@ impl Render for TerminalView {
             .size_full()
             .key_context("Terminal")
             .track_focus(&self.focus_handle)
-            .on_mouse_down(
-                gpui::MouseButton::Left,
-                cx.listener(|this, _: &MouseDownEvent, window, _cx| {
-                    this.focus_handle.focus(window);
-                }),
-            )
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, _cx| {
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
+            .on_mouse_move(cx.listener(Self::mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
+            .on_mouse_down(MouseButton::Middle, cx.listener(Self::paste_primary))
+            .on_action(cx.listener(Self::copy))
+            .on_action(cx.listener(Self::paste))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
                 if let Some(bytes) = keystroke_to_bytes(&event.keystroke) {
+                    // Typing clears the selection, like other terminals.
+                    if this.term.selection.take().is_some() {
+                        cx.notify();
+                    }
                     this.write(&bytes);
                 }
             }))
@@ -650,6 +774,9 @@ impl Render for TerminalView {
             .bg(rgb(background))
             .border_1()
             .border_color(rgb(border))
+            .rounded_md()
+            // Inner padding between the border and the text; the grid shrinks to fit.
+            .p(px(6.))
             .child(TerminalElement { view: cx.entity() })
     }
 }
@@ -687,6 +814,61 @@ mod tests {
         }
         let bytes = out.lock().unwrap().clone();
         String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn mouse_positions_map_to_cells() {
+        let cell = (10., 20.);
+        assert_eq!(cell_at(0., 0., cell, (80, 24)), (0, 0, Side::Left));
+        assert_eq!(cell_at(14., 0., cell, (80, 24)), (1, 0, Side::Left));
+        assert_eq!(cell_at(16., 45., cell, (80, 24)), (1, 2, Side::Right));
+        // Outside the grid clamps to the edges (drags past the pane).
+        assert_eq!(cell_at(-50., -50., cell, (80, 24)), (0, 0, Side::Left));
+        assert_eq!(cell_at(5000., 5000., cell, (80, 24)), (79, 23, Side::Right));
+    }
+
+    #[test]
+    fn paste_is_bracketed_and_cannot_escape() {
+        assert_eq!(paste_bytes("ls\nrm -rf x", false), b"ls\rrm -rf x");
+        assert_eq!(paste_bytes("a\r\nb", false), b"a\rb");
+        // A pasted end-marker must not end the paste early.
+        assert_eq!(
+            paste_bytes("echo hi\x1b[201~rm -rf /\n", true),
+            b"\x1b[200~echo hi[201~rm -rf /\n\x1b[201~"
+        );
+    }
+
+    #[test]
+    fn selections_copy_the_right_text() {
+        let mut term = Term::new(
+            TermConfig::default(),
+            &Dims { cols: 40, rows: 5 },
+            PtyListener {
+                writer: Arc::new(Mutex::new(Box::new(std::io::sink()))),
+                colors: TermColors::default(),
+            },
+        );
+        let mut parser: Processor = Processor::new();
+        for b in b"hello world\r\nsecond line" {
+            parser.advance(&mut term, *b);
+        }
+        let at = |line, col| GridPoint::new(Line(line), Column(col));
+
+        // Drag from "w" to "d".
+        let mut drag = Selection::new(SelectionType::Simple, at(0, 6), Side::Left);
+        drag.update(at(0, 10), Side::Right);
+        term.selection = Some(drag);
+        assert_eq!(term.selection_to_string().as_deref(), Some("world"));
+
+        // Double-click a word, triple-click a line.
+        term.selection = Some(Selection::new(SelectionType::Semantic, at(1, 2), Side::Left));
+        assert_eq!(term.selection_to_string().as_deref(), Some("second"));
+        term.selection = Some(Selection::new(SelectionType::Lines, at(0, 3), Side::Left));
+        assert_eq!(term.selection_to_string().as_deref(), Some("hello world\n"));
+
+        // A plain click selects nothing.
+        term.selection = Some(Selection::new(SelectionType::Simple, at(0, 3), Side::Left));
+        assert_eq!(term.selection_to_string().filter(|s| !s.is_empty()), None);
     }
 
     #[test]

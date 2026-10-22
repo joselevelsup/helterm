@@ -419,6 +419,7 @@ impl Render for FileExplorer {
             .bg(rgb(t.panel))
             .border_1()
             .border_color(rgb(if focused { t.accent } else { t.element }))
+            .rounded_md()
             .font_family(cx.global::<Config>().font_family.clone())
             .text_size(px(13.))
             .key_context("FileExplorer")

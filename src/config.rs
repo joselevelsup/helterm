@@ -66,6 +66,8 @@ pub struct TermColors {
     pub foreground: u32,
     pub background: u32,
     pub cursor: u32,
+    /// Background of selected text.
+    pub selection: u32,
     /// black, red, green, yellow, blue, magenta, cyan, white, then the bright ones.
     pub ansi: [u32; 16],
 }
@@ -82,6 +84,7 @@ impl Default for TermColors {
             foreground: 0xcdd6f4,
             background: 0x1e1e2e,
             cursor: 0x89b4fa,
+            selection: 0x45475a,
             ansi: [
                 0x45475a, 0xf38ba8, 0xa6e3a1, 0xf9e2af, 0x89b4fa, 0xf5c2e7, 0x94e2d5, 0xbac2de,
                 0x585b70, 0xf38ba8, 0xa6e3a1, 0xf9e2af, 0x89b4fa, 0xf5c2e7, 0x94e2d5, 0xa6adc8,
@@ -96,6 +99,7 @@ impl TermColors {
             "foreground" => Some(&mut self.foreground),
             "background" => Some(&mut self.background),
             "cursor" => Some(&mut self.cursor),
+            "selection" => Some(&mut self.selection),
             _ => {
                 let ix = ANSI_NAMES.iter().position(|n| *n == name)?;
                 Some(&mut self.ansi[ix])
@@ -126,6 +130,8 @@ const ACTIONS: &[(&str, &str, fn() -> Box<dyn Action>)] = &[
     ("toggle_maximize", "alt-m", || Box::new(ToggleMaximize)),
     ("toggle_floating", "alt-f", || Box::new(ToggleFloating)),
     ("float_focused", "alt-shift-f", || Box::new(FloatFocused)),
+    ("copy", "ctrl-shift-c", || Box::new(crate::terminal::Copy)),
+    ("paste", "ctrl-shift-v", || Box::new(crate::terminal::Paste)),
 ];
 
 pub struct Config {

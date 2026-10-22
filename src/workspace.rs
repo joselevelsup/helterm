@@ -123,6 +123,9 @@ pub struct Workspace {
     empty_focus: FocusHandle,
 }
 
+/// Space around and between panes (outer padding).
+const PANE_GAP: f32 = 6.;
+
 /// Index of the active item once item `closed` is removed and `len` remain.
 /// Closing the active item selects its right neighbour, or the new last item.
 fn active_after_close(active: usize, closed: usize, len: usize) -> usize {
@@ -1153,6 +1156,9 @@ impl Workspace {
                     .flex()
                     .flex_1()
                     .min_h_0()
+                    // Outer padding: panes sit like cards on a slightly darker backdrop.
+                    .p(px(PANE_GAP))
+                    .bg(rgb(t.panel))
                     .child(match (&tab.root, tab.maximized) {
                         (None, _) => self.render_empty_tab(cx),
                         (Some(root), maximized) => {
@@ -1253,14 +1259,14 @@ impl Workspace {
     fn render_node(&self, tab: &Tab, node: &Node<Entity<TerminalView>>) -> Div {
         match node {
             Node::Leaf(terminal) => {
-                let mut el = div().flex().flex_1().min_w_0().min_h_0().child(terminal.clone());
+                let mut el = div().flex().flex_1().min_w_0().min_h_0().gap(px(PANE_GAP)).child(terminal.clone());
                 if let Some(explorer) = tab.explorers.get(&terminal.entity_id()) {
                     el = el.child(explorer.clone());
                 }
                 el
             }
             Node::Split { axis, first, second } => {
-                let mut el = div().flex_1().min_w_0().min_h_0().flex();
+                let mut el = div().flex_1().min_w_0().min_h_0().flex().gap(px(PANE_GAP));
                 el = match axis {
                     Axis::Row => el.flex_row(),
                     Axis::Col => el.flex_col(),

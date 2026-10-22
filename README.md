@@ -89,8 +89,8 @@ size = 15
 [colors.ui]
 accent = "#7aa2f7"
 
-# What programs in the terminal see: foreground, background, cursor, and the
-# 16 ANSI colors (black, red, ..., bright_white). Helix uses its own theme.
+# What programs in the terminal see: foreground, background, cursor, selection,
+# and the 16 ANSI colors (black, red, ..., bright_white). Helix uses its own theme.
 [colors.terminal]
 background = "#1a1b26"
 
@@ -156,6 +156,19 @@ Close a tab with the `×` on its title, or by closing its last container.
 
 Each tab has at most one floating terminal. Every other key goes to the
 focused terminal or editor.
+
+### Copy and paste (in a terminal)
+
+| Keys / mouse | Action | Config name |
+| ------------ | ------ | ----------- |
+| Drag | Select text (double-click: a word, triple-click: a line) | |
+| `Ctrl+Shift+C` | Copy the selection | `copy` |
+| `Ctrl+Shift+V` | Paste | `paste` |
+| Middle-click | Paste the last selection (Linux "primary" clipboard) | |
+
+Selecting also fills the middle-click clipboard. Clicking or typing clears the
+selection. Pastes into programs that support it (shells, Helix) are bracketed,
+so multi-line pastes don't run line by line.
 
 ### File explorer (when focused)
 
