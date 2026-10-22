@@ -49,8 +49,14 @@ need Helix (`hx`) on your `PATH`; plain terminals work without it.
 ### From source
 
 ```sh
-cargo run --release
+git clone https://github.com/joselevelsup/vibe_term && cd vibe_term
+./install.sh                # builds the release binary, then installs it (same as above)
+./install.sh --uninstall    # to remove it again
 ```
+
+Run `./install.sh` again after pulling changes to update; it tells you when a
+running Vibe Term needs a restart. To try it without installing:
+`cargo run --release`.
 
 Needs stable Rust and the X11/Wayland development headers, e.g. on Fedora
 `sudo dnf install libxkbcommon-devel libxkbcommon-x11-devel`.
@@ -178,21 +184,30 @@ lines). In full-screen programs like Helix or `less` it sends arrow keys
 instead. A badge in the corner shows where you are (`12/340`, like tmux); typing
 jumps back to the bottom.
 
-`Alt+V` (`copy_mode`) toggles a tmux-style vi copy mode. Its keys never reach the
-program:
+`Alt+V` (`copy_mode`) toggles a tmux-style copy mode with **Helix keys**. Like
+Helix there is a normal mode (moving drops the selection) and a select mode
+(`v`, moving extends it). Its keys never reach the program:
 
 | Keys | Action |
 | ---- | ------ |
 | `j` / `k`, `↓` / `↑` | Move down / up (scrolls through history) |
-| `h` / `l`, `w` / `b` / `e`, `W` / `B` / `E` | Move left / right, by word |
-| `0` / `^` / `$` | Start / first character / end of line |
-| `H` / `M` / `L` | Top / middle / bottom of the screen |
-| `g` / `G` | Top of history / bottom |
+| `h` / `l`, `←` / `→` | Move left / right |
+| `w` / `b` / `e`, `W` / `B` / `E` | Next word / previous word / word end (`W`: whitespace-separated) |
+| `x` | Select the line; again to extend it down |
+| `v` | Toggle select mode |
+| `%` | Select the whole history |
+| `;` | Collapse the selection |
+| `gg` / `ge` | Top of history / last line |
+| `gh` / `gl` / `gs`, `Home` / `End` | Line start / line end / first non-blank |
+| `gt` / `gc` / `gb` | Top / middle / bottom of the screen |
 | `Ctrl+U` / `Ctrl+D` | Half a screen up / down |
 | `Ctrl+B` / `Ctrl+F`, `PageUp` / `PageDown` | A screen up / down |
-| `v` / `V` | Start (or cancel) a character / line selection |
-| `y` / `Enter` | Copy the selection and leave copy mode |
-| `q` / `Esc` | Leave copy mode |
+| `Ctrl+Y` / `Ctrl+E` | Scroll one line up / down |
+| `y` | Copy the selection and leave copy mode |
+| `Esc` | Drop the selection / select mode; again to leave copy mode |
+
+The corner badge shows `COPY` (or `COPY SEL` in select mode) and `g…` while a
+`g` key is waiting for its second key.
 
 ### File explorer (when focused)
 
@@ -236,7 +251,7 @@ the same archive in `dist/`.
 | `src/container.rs` | The Sway-style split tree |
 | `src/explorer.rs` | File explorer and its file operations |
 | `src/config.rs` | Config file: defaults, parsing with warnings, rebindable actions |
-| `packaging/` | Launcher, icon, install script, release-archive script |
+| `packaging/` | Launcher, icon, install script (`./install.sh` links to it), release-archive script |
 
 ## License
 

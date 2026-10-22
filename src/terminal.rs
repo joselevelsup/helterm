@@ -129,6 +129,7 @@ pub struct TerminalView {
     selecting: bool,
     /// Fraction of a line left over from smooth (touchpad) scrolling.
     scroll_remainder: f32,
+    copy_mode: CopyModeState,
 }
 
 impl EventEmitter<Exited> for TerminalView {}
@@ -147,26 +148,81 @@ fn cell_at(x: f32, y: f32, cell: (f32, f32), grid: (usize, usize)) -> (usize, us
 #[derive(Debug, PartialEq)]
 enum CopyModeKey {
     Handled,
-    /// Copy this text (if anything is selected) and leave copy mode.
-    Yank(Option<String>),
+    /// Copy this text and leave copy mode.
+    Yank(String),
     Exit,
     Ignored,
 }
 
-/// tmux/vi-style copy mode on top of alacritty's vi mode: keys move a cursor
-/// through the scrollback (the view follows it), `v`/`V` select, `y` copies.
-fn copy_mode_key<T: EventListener>(term: &mut Term<T>, ks: &Keystroke) -> CopyModeKey {
+/// Copy mode's own state on top of alacritty's vi mode.
+#[derive(Default)]
+struct CopyModeState {
+    /// Helix select mode (`v`): movement extends the selection.
+    extend: bool,
+    /// `g` was pressed; the next key picks the goto target.
+    pending_goto: bool,
+}
+
+enum Move {
+    Motion(ViMotion),
+    Top,
+    Bottom,
+}
+
+/// Move the copy-mode cursor the Helix way: in normal mode a move drops the
+/// selection, in select mode it extends it (anchored where the cursor was).
+fn apply_move<T: EventListener>(term: &mut Term<T>, state: &CopyModeState, mv: Move) {
+    if !state.extend {
+        term.selection = None;
+    } else if term.selection.is_none() {
+        let mut selection = Selection::new(SelectionType::Simple, term.vi_mode_cursor.point, Side::Left);
+        // An empty selection would not grow as the cursor moves.
+        selection.include_all();
+        term.selection = Some(selection);
+    }
+    match mv {
+        Move::Motion(motion) => {
+            term.vi_motion(motion);
+            let point = term.vi_mode_cursor.point;
+            // The view follows the cursor into the scrollback.
+            term.scroll_to_point(point);
+        }
+        Move::Top => term.vi_goto_point(GridPoint::new(term.topmost_line(), Column(0))),
+        Move::Bottom => term.vi_goto_point(GridPoint::new(term.bottommost_line(), Column(0))),
+    }
+}
+
+/// Helix-style copy mode: keys move a cursor through the scrollback, `x`/`v`
+/// select, `y` copies.
+fn copy_mode_key<T: EventListener>(term: &mut Term<T>, state: &mut CopyModeState, ks: &Keystroke) -> CopyModeKey {
     let ctrl = ks.modifiers.control;
-    // Prefer the typed character ("G", "$"); fall back to the key name.
+    // Prefer the typed character ("W", "%"); fall back to the key name.
     let key = match ks.key_char.as_deref() {
         Some(typed) if !ctrl => typed.to_owned(),
         _ if ks.modifiers.shift && ks.key.chars().count() == 1 => ks.key.to_uppercase(),
         _ => ks.key.clone(),
     };
-    let half_page = (term.screen_lines() / 2).max(1) as i32;
-    let motion = match (ctrl, key.as_str()) {
-        (false, "j" | "J" | "down") => Some(ViMotion::Down),
-        (false, "k" | "K" | "up") => Some(ViMotion::Up),
+    let key = key.as_str();
+
+    if std::mem::take(&mut state.pending_goto) {
+        let mv = match key {
+            "g" => Move::Top,
+            "e" => Move::Bottom,
+            "h" => Move::Motion(ViMotion::First),
+            "l" => Move::Motion(ViMotion::Last),
+            "s" => Move::Motion(ViMotion::FirstOccupied),
+            "t" => Move::Motion(ViMotion::High),
+            "c" => Move::Motion(ViMotion::Middle),
+            "b" => Move::Motion(ViMotion::Low),
+            _ => return CopyModeKey::Handled, // unknown goto: cancel, like Helix
+        };
+        apply_move(term, state, mv);
+        return CopyModeKey::Handled;
+    }
+
+    let motion = match (ctrl, key) {
+        (false, "j" | "down") => Some(ViMotion::Down),
+        (false, "k" | "up") => Some(ViMotion::Up),
         (false, "h" | "left") => Some(ViMotion::Left),
         (false, "l" | "right") => Some(ViMotion::Right),
         (false, "w") => Some(ViMotion::SemanticRight),
@@ -175,21 +231,17 @@ fn copy_mode_key<T: EventListener>(term: &mut Term<T>, ks: &Keystroke) -> CopyMo
         (false, "W") => Some(ViMotion::WordRight),
         (false, "B") => Some(ViMotion::WordLeft),
         (false, "E") => Some(ViMotion::WordRightEnd),
-        (false, "0" | "home") => Some(ViMotion::First),
-        (false, "$" | "end") => Some(ViMotion::Last),
-        (false, "^") => Some(ViMotion::FirstOccupied),
-        (false, "H") => Some(ViMotion::High),
-        (false, "M") => Some(ViMotion::Middle),
-        (false, "L") => Some(ViMotion::Low),
+        (false, "home") => Some(ViMotion::First),
+        (false, "end") => Some(ViMotion::Last),
         _ => None,
     };
     if let Some(motion) = motion {
-        term.vi_motion(motion);
-        let point = term.vi_mode_cursor.point;
-        term.scroll_to_point(point);
+        apply_move(term, state, Move::Motion(motion));
         return CopyModeKey::Handled;
     }
-    let scroll = match (ctrl, key.as_str()) {
+
+    let half_page = (term.screen_lines() / 2).max(1) as i32;
+    let scroll = match (ctrl, key) {
         (true, "u") => Some(Scroll::Delta(half_page)),
         (true, "d") => Some(Scroll::Delta(-half_page)),
         (true, "b") | (false, "pageup") => Some(Scroll::PageUp),
@@ -199,32 +251,45 @@ fn copy_mode_key<T: EventListener>(term: &mut Term<T>, ks: &Keystroke) -> CopyMo
         _ => None,
     };
     if let Some(scroll) = scroll {
-        // Keeps the vi cursor inside the view, as tmux does.
+        // Keeps the cursor inside the view.
         term.scroll_display(scroll);
         return CopyModeKey::Handled;
     }
-    match (ctrl, key.as_str()) {
-        (false, "g") => {
-            let top = GridPoint::new(term.topmost_line(), Column(0));
-            term.vi_goto_point(top);
-        }
-        (false, "G") => {
-            let bottom = GridPoint::new(term.bottommost_line(), Column(0));
-            term.vi_goto_point(bottom);
-        }
-        (false, "v" | "V") => {
-            let ty = if key == "V" { SelectionType::Lines } else { SelectionType::Simple };
-            if term.selection.as_ref().is_some_and(|s| s.ty == ty) {
-                term.selection = None; // pressing it again cancels, like vim
+
+    match (ctrl, key) {
+        (false, "g") => state.pending_goto = true,
+        (false, "x") => {
+            if term.selection.as_ref().is_some_and(|s| s.ty == SelectionType::Lines) {
+                // Already on whole lines: grow by one more, like Helix.
+                term.vi_motion(ViMotion::Down);
+                let point = term.vi_mode_cursor.point;
+                term.scroll_to_point(point);
             } else {
-                let mut selection = Selection::new(ty, term.vi_mode_cursor.point, Side::Left);
-                // An empty selection would not grow as the cursor moves.
+                let mut selection = Selection::new(SelectionType::Lines, term.vi_mode_cursor.point, Side::Left);
                 selection.include_all();
                 term.selection = Some(selection);
             }
         }
-        (false, "y" | "enter") => return CopyModeKey::Yank(term.selection_to_string()),
-        (false, "escape" | "q") | (true, "c") => return CopyModeKey::Exit,
+        (false, "v") => state.extend = !state.extend,
+        (false, "%") => {
+            let mut all = Selection::new(SelectionType::Lines, GridPoint::new(term.topmost_line(), Column(0)), Side::Left);
+            all.update(GridPoint::new(term.bottommost_line(), term.last_column()), Side::Right);
+            term.selection = Some(all);
+        }
+        (false, ";") => term.selection = None,
+        (false, "y") => match term.selection_to_string().filter(|text| !text.is_empty()) {
+            Some(text) => return CopyModeKey::Yank(text),
+            None => {} // nothing selected: stay, so a stray y doesn't drop you out
+        },
+        (false, "escape") | (true, "c") => {
+            // Like Helix: first Esc leaves select mode / drops the selection.
+            if state.extend || term.selection.is_some() {
+                state.extend = false;
+                term.selection = None;
+            } else {
+                return CopyModeKey::Exit;
+            }
+        }
         _ => return CopyModeKey::Ignored,
     }
     CopyModeKey::Handled
@@ -338,6 +403,7 @@ impl TerminalView {
             cell_size: Size::default(),
             selecting: false,
             scroll_remainder: 0.,
+            copy_mode: CopyModeState::default(),
         }
     }
 
@@ -408,6 +474,7 @@ impl TerminalView {
             self.exit_copy_mode();
         } else {
             self.term.selection = None;
+            self.copy_mode = CopyModeState::default();
             self.term.toggle_vi_mode();
         }
         cx.notify();
@@ -417,6 +484,7 @@ impl TerminalView {
         if self.in_copy_mode() {
             self.term.toggle_vi_mode();
         }
+        self.copy_mode = CopyModeState::default();
         self.term.selection = None;
         self.term.scroll_display(Scroll::Bottom);
     }
@@ -885,7 +953,11 @@ impl Render for TerminalView {
         let grid = self.term.grid();
         let (offset, history) = (grid.display_offset(), grid.history_size());
         let badge = match self.in_copy_mode() {
-            true => Some(format!("COPY  {offset}/{history}")),
+            true => {
+                let mode = if self.copy_mode.extend { "COPY SEL" } else { "COPY" };
+                let goto = if self.copy_mode.pending_goto { "  g…" } else { "" };
+                Some(format!("{mode}  {offset}/{history}{goto}"))
+            }
             false => (offset > 0).then(|| format!("{offset}/{history}")),
         };
         let (badge_bg, badge_fg) = {
@@ -918,13 +990,11 @@ impl Render for TerminalView {
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
                 if this.in_copy_mode() {
                     // Copy mode keys never reach the program.
-                    match copy_mode_key(&mut this.term, &event.keystroke) {
+                    match copy_mode_key(&mut this.term, &mut this.copy_mode, &event.keystroke) {
                         CopyModeKey::Ignored => return,
                         CopyModeKey::Handled => {}
                         CopyModeKey::Yank(text) => {
-                            if let Some(text) = text.filter(|t| !t.is_empty()) {
-                                cx.write_to_clipboard(ClipboardItem::new_string(text));
-                            }
+                            cx.write_to_clipboard(ClipboardItem::new_string(text));
                             this.exit_copy_mode();
                         }
                         CopyModeKey::Exit => this.exit_copy_mode(),
@@ -1079,50 +1149,70 @@ mod tests {
         term
     }
 
-    fn press(term: &mut Term<PtyListener>, key: &str) -> CopyModeKey {
-        copy_mode_key(term, &Keystroke::parse(key).unwrap())
+    fn press(term: &mut Term<PtyListener>, state: &mut CopyModeState, keys: &str) -> CopyModeKey {
+        let mut last = CopyModeKey::Ignored;
+        for key in keys.split_whitespace() {
+            last = copy_mode_key(term, state, &Keystroke::parse(key).unwrap());
+        }
+        last
     }
 
     #[test]
-    fn copy_mode_scrolls_selects_and_yanks() {
+    fn copy_mode_uses_helix_keys() {
         let mut term = term_with_lines(30);
+        let st = &mut CopyModeState::default();
         term.toggle_vi_mode();
-        assert_eq!(term.grid().display_offset(), 0);
 
         // k walks up past the top of the screen: the view follows into history.
-        for _ in 0..10 {
-            assert_eq!(press(&mut term, "k"), CopyModeKey::Handled);
-        }
+        press(&mut term, st, "k k k k k k k k k k");
         assert!(term.grid().display_offset() > 0);
 
-        // g: top of history, G: back to the bottom.
-        press(&mut term, "g");
+        // gg: top of history, ge: last line.
+        press(&mut term, st, "g g");
         assert_eq!(term.grid().display_offset(), term.grid().history_size());
-        press(&mut term, "shift-g");
+        press(&mut term, st, "g e");
         assert_eq!(term.grid().display_offset(), 0);
 
-        // Go to "line 3", select two whole lines, yank.
-        press(&mut term, "g");
-        for _ in 0..3 {
-            press(&mut term, "j");
-        }
-        press(&mut term, "V->V");
-        press(&mut term, "j");
-        assert_eq!(
-            press(&mut term, "y"),
-            CopyModeKey::Yank(Some("line 3\nline 4\n".to_owned()))
-        );
+        // x selects the line, x again extends it, y copies.
+        press(&mut term, st, "g g j j j x x");
+        assert_eq!(press(&mut term, st, "y"), CopyModeKey::Yank("line 3\nline 4\n".into()));
+
+        // Normal mode: moving drops the selection.
+        press(&mut term, st, "g g x j");
+        assert!(term.selection.is_none());
+
+        // v: select mode, movement extends from where the cursor was.
+        press(&mut term, st, "g g j v l l l");
+        assert_eq!(press(&mut term, st, "y"), CopyModeKey::Yank("line".into()));
+        press(&mut term, st, "v"); // back to normal mode
+
+        // gl / gh: end of the line's text ("line 0" ends at column 5) / start.
+        press(&mut term, st, "g g g l");
+        assert_eq!(term.vi_mode_cursor.point.column, Column(5));
+        press(&mut term, st, "g h");
+        assert_eq!(term.vi_mode_cursor.point.column, Column(0));
+
+        // %: everything; ; collapses.
+        press(&mut term, st, "%->%");
+        assert!(term.selection_to_string().unwrap().starts_with("line 0\nline 1\n"));
+        press(&mut term, st, ";->;");
+        assert!(term.selection.is_none());
 
         // Ctrl+U / Ctrl+D scroll by half a screen.
-        press(&mut term, "shift-g");
-        press(&mut term, "ctrl-u");
+        press(&mut term, st, "g e ctrl-u");
         assert_eq!(term.grid().display_offset(), 2);
-        press(&mut term, "ctrl-d");
+        press(&mut term, st, "ctrl-d");
         assert_eq!(term.grid().display_offset(), 0);
 
-        assert_eq!(press(&mut term, "x"), CopyModeKey::Ignored);
-        assert_eq!(press(&mut term, "q"), CopyModeKey::Exit);
-        assert_eq!(press(&mut term, "escape"), CopyModeKey::Exit);
+        // y with nothing selected stays in copy mode; unknown keys do nothing.
+        assert_eq!(press(&mut term, st, "y"), CopyModeKey::Handled);
+        assert_eq!(press(&mut term, st, "q"), CopyModeKey::Ignored);
+
+        // Esc: first drops the selection / select mode, then leaves.
+        press(&mut term, st, "x");
+        assert_eq!(press(&mut term, st, "escape"), CopyModeKey::Handled);
+        assert!(term.selection.is_none());
+        assert_eq!(press(&mut term, st, "escape"), CopyModeKey::Exit);
     }
 
     #[test]
