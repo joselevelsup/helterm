@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use gpui::{
-    App, Context, Div, Entity, EntityId, FocusHandle, Focusable, KeyDownEvent, MouseButton,
+    App, Context, Div, Entity, EntityId, FocusHandle, Hsla, Focusable, KeyDownEvent, MouseButton,
     MouseDownEvent, PathPromptOptions, Render, SharedString, Stateful, Window, actions, div, hsla,
     prelude::*, px, relative, rgb,
 };
@@ -29,6 +29,7 @@ actions!(
         PrevTab,
         ToggleSidebar,
         ToggleMaximize,
+        ToggleManage,
         ToggleFloating,
         FloatFocused,
         CloseWorkspace,
@@ -128,6 +129,22 @@ impl Project {
     }
 }
 
+/// Management mode (Alt+M): pick a container, then resize or move it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ManageMode {
+    Select,
+    Resize,
+    Move,
+}
+
+struct Manage {
+    mode: ManageMode,
+    /// The container being managed; h/j/k/l moves this in Select mode.
+    selected: EntityId,
+    /// Holds keyboard focus so keys drive the mode instead of the terminals.
+    focus_handle: FocusHandle,
+}
+
 /// State of the "Close workspace?" confirmation.
 struct ConfirmClose {
     project: usize,
@@ -148,6 +165,7 @@ pub struct Workspace {
     sidebar_collapsed: bool,
     new_workspace: Option<NewWorkspaceModal>,
     confirm_close: Option<ConfirmClose>,
+    manage: Option<Manage>,
     /// The user closed the problems banner.
     config_warnings_dismissed: bool,
     /// Problems loading/saving the workspace list, shown in the same banner.
@@ -225,6 +243,7 @@ impl Workspace {
             sidebar_collapsed: false,
             new_workspace: None,
             confirm_close: None,
+            manage: None,
             config_warnings_dismissed: false,
             state_warnings: vec![],
             window_title: String::new(),
@@ -697,6 +716,92 @@ impl Workspace {
         }
     }
 
+    // Management mode ------------------------------------------------------------
+
+    fn toggle_manage(&mut self, _: &ToggleManage, window: &mut Window, cx: &mut Context<Self>) {
+        if self.manage.is_some() {
+            self.exit_manage(window, cx);
+            return;
+        }
+        if self.projects.is_empty() || self.new_workspace.is_some() || self.confirm_close.is_some() {
+            return;
+        }
+        let Some(root) = self.tab().root.as_ref() else {
+            return; // nothing tiled to manage
+        };
+        let first = root.first_leaf().map(|leaf| leaf.entity_id());
+        let Some(selected) = self.focused_id(window, cx).filter(|id| self.is_tiled(*id)).or(first) else {
+            return;
+        };
+        // Everything should be visible while rearranging.
+        let tab = self.tab_mut();
+        tab.maximized = None;
+        tab.show_only(None);
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        self.manage = Some(Manage {
+            mode: ManageMode::Select,
+            selected,
+            focus_handle,
+        });
+        cx.notify();
+    }
+
+    /// Leave management mode, focusing the container that was selected.
+    fn exit_manage(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(manage) = self.manage.take() else {
+            return;
+        };
+        match self.find_container(manage.selected) {
+            Some(container) => container.read(cx).focus_handle(cx).focus(window),
+            None => self.focus_active_tab(window, cx),
+        }
+        cx.notify();
+    }
+
+    fn manage_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(manage) = self.manage.as_ref() else {
+            return;
+        };
+        let (mode, selected) = (manage.mode, manage.selected);
+        let ks = &event.keystroke;
+        if ks.modifiers.control || ks.modifiers.alt || ks.modifiers.platform {
+            return;
+        }
+        let dir = match ks.key.as_str() {
+            "h" | "left" => Some(FocusDir::Left),
+            "j" | "down" => Some(FocusDir::Down),
+            "k" | "up" => Some(FocusDir::Up),
+            "l" | "right" => Some(FocusDir::Right),
+            _ => None,
+        };
+        match (mode, ks.key.as_str(), dir) {
+            (_, "enter", _) | (ManageMode::Select, "escape", _) => self.exit_manage(window, cx),
+            (_, "escape", _) => self.set_manage_mode(ManageMode::Select),
+            (ManageMode::Select, "r", _) => self.set_manage_mode(ManageMode::Resize),
+            (ManageMode::Select, "m", _) => self.set_manage_mode(ManageMode::Move),
+            (ManageMode::Select, "z", _) => {
+                self.tab_mut().maximized = Some(selected);
+                self.exit_manage(window, cx);
+            }
+            (ManageMode::Select, _, Some(dir)) => {
+                let next = self.tab().root.as_ref().and_then(|root| root.focus_dir(selected.as_u64(), dir));
+                if let (Some(next), Some(manage)) = (next.map(|leaf| leaf.entity_id()), self.manage.as_mut()) {
+                    manage.selected = next;
+                }
+            }
+            _ => return,
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn set_manage_mode(&mut self, mode: ManageMode) {
+        if let Some(manage) = self.manage.as_mut() {
+            manage.mode = mode;
+        }
+    }
+
     fn toggle_maximize(&mut self, _: &ToggleMaximize, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(id) = self.focused_id(window, cx).filter(|id| self.is_tiled(*id)) {
             let tab = self.tab_mut();
@@ -805,6 +910,7 @@ impl Workspace {
             tab.root = Some(match tab.root.take() {
                 Some(old) => Node::Split {
                     axis: Axis::Row,
+                    ratio: 0.5,
                     first: Box::new(old),
                     second: Box::new(Node::Leaf(terminal)),
                 },
@@ -1220,12 +1326,17 @@ impl Workspace {
                     // Outer padding: panes sit like cards on a slightly darker backdrop.
                     .p(px(PANE_GAP))
                     .bg(rgb(t.panel))
+                    .when_some(self.manage.as_ref(), |el, manage| {
+                        el.track_focus(&manage.focus_handle)
+                            .key_context("ManageMode")
+                            .on_key_down(cx.listener(Self::manage_key))
+                    })
                     .child(match (&tab.root, tab.maximized) {
                         (None, _) => self.render_empty_tab(cx),
                         (Some(root), maximized) => {
                             match maximized.and_then(|id| root.find_leaf(id.as_u64())) {
-                                Some(leaf) => self.render_node(tab, &Node::Leaf(leaf.clone())),
-                                None => self.render_node(tab, root),
+                                Some(leaf) => self.render_node(tab, &Node::Leaf(leaf.clone()), t),
+                                None => self.render_node(tab, root, t),
                             }
                         }
                     })
@@ -1245,9 +1356,10 @@ impl Workspace {
                                 .shadow_lg()
                                 // Clicks must not fall through to the tiles underneath.
                                 .occlude()
-                                .child(self.render_node(tab, &Node::Leaf(floating.terminal.clone()))),
+                                .child(self.render_node(tab, &Node::Leaf(floating.terminal.clone()), t)),
                         )
-                    }),
+                    })
+                    .when_some(self.manage.as_ref(), |el, manage| el.child(manage_pill(manage.mode, t))),
             )
     }
 
@@ -1317,23 +1429,40 @@ impl Workspace {
             )
     }
 
-    fn render_node(&self, tab: &Tab, node: &Node<Entity<TerminalView>>) -> Div {
+    fn render_node(&self, tab: &Tab, node: &Node<Entity<TerminalView>>, t: UiColors) -> Div {
         match node {
             Node::Leaf(terminal) => {
-                let mut el = div().flex().flex_1().min_w_0().min_h_0().gap(px(PANE_GAP)).child(terminal.clone());
+                let mut el = div().relative().flex().flex_1().min_w_0().min_h_0().gap(px(PANE_GAP)).child(terminal.clone());
                 if let Some(explorer) = tab.explorers.get(&terminal.entity_id()) {
                     el = el.child(explorer.clone());
                 }
+                let selected = self.manage.as_ref().is_some_and(|m| m.selected == terminal.entity_id());
+                if selected {
+                    // Light tint so the terminal underneath stays readable.
+                    let accent: Hsla = rgb(t.accent).into();
+                    el = el.child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size_full()
+                            .rounded_md()
+                            .bg(Hsla { a: 0.15, ..accent })
+                            .border_2()
+                            .border_color(accent),
+                    );
+                }
                 el
             }
-            Node::Split { axis, first, second } => {
+            Node::Split { axis, ratio, first, second } => {
                 let mut el = div().flex_1().min_w_0().min_h_0().flex().gap(px(PANE_GAP));
                 el = match axis {
                     Axis::Row => el.flex_row(),
                     Axis::Col => el.flex_col(),
                 };
-                el.child(self.render_node(tab, first))
-                    .child(self.render_node(tab, second))
+                // Children split the space by the ratio (flex basis 0, grow by share).
+                el.child(grow(self.render_node(tab, first, t), *ratio))
+                    .child(grow(self.render_node(tab, second, t), 1. - *ratio))
             }
         }
     }
@@ -1341,6 +1470,11 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let stale = self.manage.as_ref().is_some_and(|m| self.projects.is_empty() || !self.is_tiled(m.selected));
+        if stale {
+            self.manage = None;
+            self.focus_active_tab(window, cx);
+        }
         let title = match self.projects.get(self.active) {
             Some(project) => format!("{} - Vibe Term", project.name()),
             None => "Vibe Term".to_owned(),
@@ -1360,6 +1494,7 @@ impl Render for Workspace {
             .font_family(cx.global::<Config>().font_family.clone())
             // Workspace-level actions work even with no workspace open.
             .on_action(cx.listener(Self::toggle_sidebar))
+            .on_action(cx.listener(Self::toggle_manage))
             .on_action(cx.listener(Self::close_workspace))
             .on_action(cx.listener(Self::new_workspace))
             .on_action(cx.listener(Self::next_workspace))
@@ -1402,6 +1537,39 @@ impl Render for Workspace {
                 el.child(self.render_confirm_close(modal, cx))
             })
     }
+}
+
+/// Give a flex child `share` of its parent's free space.
+fn grow(mut el: Div, share: f32) -> Div {
+    el.style().flex_grow = Some(share);
+    el
+}
+
+/// The pill showing which management mode is active and its keys.
+fn manage_pill(mode: ManageMode, t: UiColors) -> Div {
+    let text = match mode {
+        ManageMode::Select => "MANAGE  ·  hjkl select  ·  r resize  ·  m move  ·  z zoom  ·  esc exit",
+        ManageMode::Resize => "RESIZE  ·  h/l width  ·  j/k height  ·  esc back",
+        ManageMode::Move => "MOVE  ·  hjkl swap  ·  esc back",
+    };
+    div()
+        .absolute()
+        .top(px(PANE_GAP + 6.))
+        .left_0()
+        .right_0()
+        .flex()
+        .justify_center()
+        .child(
+            div()
+                .px_3()
+                .py_1()
+                .rounded_full()
+                .bg(rgb(t.accent))
+                .text_color(rgb(t.background))
+                .text_size(px(12.))
+                .shadow_lg()
+                .child(text),
+        )
 }
 
 /// Dimmed full-window backdrop that owns focus while a dialog is open.

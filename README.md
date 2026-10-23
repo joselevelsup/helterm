@@ -167,7 +167,8 @@ Close a tab with the `×` on its title, or by closing its last container.
 | `Alt+O` | New Helix editor, split to the right | `new_editor` |
 | `Alt+Q` | Close the focused container | `close_container` |
 | `Alt+H` / `Alt+J` / `Alt+K` / `Alt+L` | Move focus left / down / up / right | `focus_left` / `focus_down` / `focus_up` / `focus_right` |
-| `Alt+M` | Maximize / restore the focused container | `toggle_maximize` |
+| `Alt+Z` | Maximize / restore the focused container (like tmux's zoom) | `toggle_maximize` |
+| `Alt+M` | Management mode: select, resize and move containers (see below) | `manage_mode` |
 | `Alt+F` | New floating terminal, or hide / show it | `toggle_floating` |
 | `Alt+Shift+F` | Float the focused container, or put the floating one back | `float_focused` |
 | `Alt+E` | Editor: open / focus its file explorer. Explorer: close it | `toggle_explorer` |
@@ -222,6 +223,22 @@ Helix there is a normal mode (moving drops the selection) and a select mode
 
 The corner badge shows `COPY` (or `COPY SEL` in select mode) and `g…` while a
 `g` key is waiting for its second key.
+
+### Management mode
+
+`Alt+M` (`manage_mode`) lets you rearrange the containers of a tab, a bit like
+Pop Shell's adjustment mode. The selected container gets a light tint and a pill
+at the top shows the mode and its keys. Keys go to management mode, not the
+terminals.
+
+| Mode | Keys |
+| ---- | ---- |
+| Manage | `h` / `j` / `k` / `l` select a container, `r` resize, `m` move, `z` maximize it, `Esc` / `Enter` / `Alt+M` leave |
+| Resize | `l` / `h` wider / narrower, `j` / `k` taller / shorter, `Esc` back |
+| Move | `h` / `j` / `k` / `l` swap with the neighbour on that side, `Esc` back |
+
+Leaving focuses the selected container. Entering un-maximizes and hides
+floating terminals so everything is visible.
 
 ### File explorer (when focused)
 

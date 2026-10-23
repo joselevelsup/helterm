@@ -38,11 +38,13 @@ impl Leaf for u64 {
 }
 
 /// Sway-style binary split tree. A leaf is one terminal; splits nest freely.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Node<L> {
     Leaf(L),
     Split {
         axis: Axis,
+        /// Share of the space the first child gets (0.5 = even).
+        ratio: f32,
         first: Box<Node<L>>,
         second: Box<Node<L>>,
     },
@@ -87,6 +89,7 @@ impl<L: Leaf> Node<L> {
                 let old = self.clone();
                 *self = Node::Split {
                     axis,
+                    ratio: 0.5,
                     first: Box::new(old),
                     second: Box::new(Node::Leaf(new_leaf)),
                 };
@@ -135,7 +138,7 @@ impl<L: Leaf> Node<L> {
     pub fn focus_dir(&self, id: u64, dir: FocusDir) -> Option<&L> {
         match self {
             Node::Leaf(_) => None,
-            Node::Split { axis, first, second } => {
+            Node::Split { axis, first, second, .. } => {
                 let horizontal = matches!(dir, FocusDir::Left | FocusDir::Right);
                 if (*axis == Axis::Row) == horizontal {
                     if first.contains(id) {
@@ -184,15 +187,16 @@ impl<L: Leaf> Node<L> {
 
     /// Where leaf `id` sits: its parent's axis, its side, and its sibling subtree.
     pub fn placement(&self, id: u64) -> Option<Placement> {
-        let Node::Split { axis, first, second } = self else {
+        let Node::Split { axis, ratio, first, second } = self else {
             return None;
         };
         let is_leaf = |n: &Node<L>| matches!(n, Node::Leaf(l) if l.leaf_id() == id);
+        let (axis, ratio) = (*axis, *ratio);
         if is_leaf(first) {
-            return Some(Placement { axis: *axis, first: true, sibling: second.sorted_ids() });
+            return Some(Placement { axis, ratio, first: true, sibling: second.sorted_ids() });
         }
         if is_leaf(second) {
-            return Some(Placement { axis: *axis, first: false, sibling: first.sorted_ids() });
+            return Some(Placement { axis, ratio, first: false, sibling: first.sorted_ids() });
         }
         first.placement(id).or_else(|| second.placement(id))
     }
@@ -204,7 +208,7 @@ impl<L: Leaf> Node<L> {
             let old = Box::new(self.clone());
             let new = Box::new(Node::Leaf(leaf));
             let (first, second) = if placement.first { (new, old) } else { (old, new) };
-            *self = Node::Split { axis: placement.axis, first, second };
+            *self = Node::Split { axis: placement.axis, ratio: placement.ratio, first, second };
             return true;
         }
         match self {
@@ -217,9 +221,11 @@ impl<L: Leaf> Node<L> {
 }
 
 /// A leaf's spot in the tree, recorded so it can be put back after floating.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Placement {
     axis: Axis,
+    /// The split's size, so putting the leaf back restores it too.
+    ratio: f32,
     /// Whether the leaf was the first (left/top) child.
     first: bool,
     /// Sorted leaf ids of the sibling subtree it was split from.
@@ -267,6 +273,7 @@ mod tests {
             tree,
             Node::Split {
                 axis: Axis::Row,
+                ratio: 0.5,
                 first: Box::new(Node::Leaf(1)),
                 second: Box::new(Node::Leaf(2)),
             }
@@ -297,6 +304,7 @@ mod tests {
             tree,
             Node::Split {
                 axis: Axis::Row,
+                ratio: 0.5,
                 first: Box::new(Node::Leaf(3)),
                 second: Box::new(Node::Leaf(2)),
             }
