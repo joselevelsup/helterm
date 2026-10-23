@@ -784,6 +784,11 @@ impl CellStyle {
         }
     }
 
+    /// Same look for the glyphs (background aside, it's painted separately).
+    fn same_text(&self, other: &CellStyle) -> bool {
+        self.fg == other.fg && self.flags == other.flags && self.underline_color == other.underline_color
+    }
+
     fn run(&self, len: usize, font: &Font) -> TextRun {
         let mut font = font.clone();
         if self.flags.contains(Flags::BOLD) {
@@ -805,7 +810,7 @@ impl CellStyle {
             len,
             font,
             color: self.fg,
-            background_color: self.bg,
+            background_color: None, // painted as rectangles, see prepaint
             underline,
             strikethrough,
         }
@@ -817,9 +822,39 @@ struct TerminalElement {
 }
 
 struct TerminalPrepaint {
-    rows: Vec<ShapedLine>,
+    /// Same-style pieces of text: (row, start column, shaped text).
+    texts: Vec<(usize, usize, ShapedLine)>,
+    /// Cell backgrounds: (row, start column, columns, color).
+    backgrounds: Vec<(usize, usize, usize, Hsla)>,
     cursor: Option<(usize, usize, CursorShape)>,
     cell_width: Pixels,
+}
+
+/// Shape one same-style piece of a row, skipping pieces with nothing to draw.
+/// Shaping per piece (not per row) lets gpui's layout cache reuse every piece
+/// that didn't change, e.g. Helix's code text when only line numbers change.
+#[allow(clippy::too_many_arguments)]
+fn shape_piece(
+    piece: &mut String,
+    style: Option<CellStyle>,
+    row: usize,
+    start: usize,
+    font: &Font,
+    font_size: Pixels,
+    cell_width: Pixels,
+    window: &mut Window,
+    texts: &mut Vec<(usize, usize, ShapedLine)>,
+) {
+    let text = std::mem::take(piece);
+    let Some(style) = style else { return };
+    let decorated = style.flags.intersects(Flags::ALL_UNDERLINES | Flags::STRIKEOUT);
+    if text.trim_end().is_empty() && !decorated || style.fg.a == 0. {
+        return;
+    }
+    let run = style.run(text.len(), font);
+    // force_width snaps every glyph to the cell grid.
+    let line = window.text_system().shape_line(text.into(), font_size, &[run], Some(cell_width));
+    texts.push((row, start, line));
 }
 
 impl IntoElement for TerminalElement {
@@ -897,43 +932,39 @@ impl Element for TerminalElement {
         let columns = term.grid().columns();
         let screen_lines = term.grid().screen_lines();
 
-        let mut rows: Vec<ShapedLine> = Vec::with_capacity(screen_lines);
-        let mut row_text = String::new();
-        let mut row_runs: Vec<TextRun> = Vec::new();
-        let mut run_start = 0usize;
-        let mut cur: Option<CellStyle> = None;
-        let mut col = 0usize;
+        // Backgrounds become rectangles and never touch text shaping, so a moving
+        // cursorline / cursorcolumn (Helix) doesn't force every row to be reshaped.
+        let mut texts = Vec::new();
+        let mut backgrounds = Vec::new();
+        let mut piece = String::new();
+        let (mut piece_start, mut piece_style) = (0usize, None::<CellStyle>);
+        let (mut bg_start, mut bg) = (0usize, None::<Hsla>);
+        let (mut row, mut col) = (0usize, 0usize);
 
         for cell in display_iter {
-            let mut cell_style = CellStyle::of(&cell, &colors);
+            let mut style = CellStyle::of(&cell, &colors);
             if selection.is_some_and(|s| s.contains(cell.point)) {
-                cell_style.bg = Some(selection_bg);
+                style.bg = Some(selection_bg);
             }
-            if cur != Some(cell_style) {
-                if let Some(prev) = cur.filter(|_| row_text.len() > run_start) {
-                    row_runs.push(prev.run(row_text.len() - run_start, &font));
+            if style.bg != bg {
+                if let Some(color) = bg {
+                    backgrounds.push((row, bg_start, col - bg_start, color));
                 }
-                run_start = row_text.len();
-                cur = Some(cell_style);
+                (bg_start, bg) = (col, style.bg);
+            }
+            if !piece_style.is_some_and(|p| p.same_text(&style)) {
+                shape_piece(&mut piece, piece_style, row, piece_start, &font, font_size, cell_width, window, &mut texts);
+                (piece_start, piece_style) = (col, Some(style));
             }
             // Wide-char spacer cells stay as ' ' so every cell maps to one glyph.
-            row_text.push(cell.c);
+            piece.push(cell.c);
             col += 1;
             if col == columns {
-                if let Some(prev) = cur.filter(|_| row_text.len() > run_start) {
-                    row_runs.push(prev.run(row_text.len() - run_start, &font));
+                if let Some(color) = bg.take() {
+                    backgrounds.push((row, bg_start, col - bg_start, color));
                 }
-                // force_width snaps every glyph to the cell grid.
-                rows.push(window.text_system().shape_line(
-                    SharedString::from(std::mem::take(&mut row_text)),
-                    font_size,
-                    &row_runs,
-                    Some(cell_width),
-                ));
-                row_runs.clear();
-                run_start = 0;
-                cur = None;
-                col = 0;
+                shape_piece(&mut piece, piece_style.take(), row, piece_start, &font, font_size, cell_width, window, &mut texts);
+                (row, col) = (row + 1, 0);
             }
         }
 
@@ -948,7 +979,8 @@ impl Element for TerminalElement {
         };
 
         TerminalPrepaint {
-            rows,
+            texts,
+            backgrounds,
             cursor,
             cell_width,
         }
@@ -979,14 +1011,14 @@ impl Element for TerminalElement {
             }
         });
 
-        // Backgrounds are a separate pass in gpui; all of them go under all text.
-        for (i, line) in prepaint.rows.iter().enumerate() {
-            let origin = bounds.origin + point(px(0.), line_height * i as f32);
-            let _ = line.paint_background(origin, line_height, window, cx);
+        // All backgrounds first, then all text on top.
+        let at = |row: usize, col: usize| bounds.origin + point(cell_width * col as f32, line_height * row as f32);
+        for &(row, col, cols, color) in &prepaint.backgrounds {
+            let rect = Bounds::new(at(row, col), size(cell_width * cols as f32, line_height));
+            window.paint_quad(gpui::fill(rect, color));
         }
-        for (i, line) in prepaint.rows.iter().enumerate() {
-            let origin = bounds.origin + point(px(0.), line_height * i as f32);
-            let _ = line.paint(origin, line_height, window, cx);
+        for (row, col, line) in &prepaint.texts {
+            let _ = line.paint(at(*row, *col), line_height, window, cx);
         }
 
         if let Some((row, column, shape)) = prepaint.cursor {
