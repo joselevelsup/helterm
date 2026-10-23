@@ -176,6 +176,9 @@ pub struct Workspace {
     empty_focus: FocusHandle,
 }
 
+/// How much one resize key press grows / shrinks a pane (share of its split).
+const RESIZE_STEP: f32 = 0.05;
+
 /// Space around and between panes (outer padding).
 const PANE_GAP: f32 = 6.;
 
@@ -783,6 +786,28 @@ impl Workspace {
             (ManageMode::Select, "z", _) => {
                 self.tab_mut().maximized = Some(selected);
                 self.exit_manage(window, cx);
+            }
+            (ManageMode::Move, _, Some(dir)) => {
+                // Swap with the neighbour on that side; the selection follows the
+                // pane (it's tracked by id), so it can keep moving.
+                if let Some(root) = self.tab_mut().root.as_mut() {
+                    let neighbour = root.focus_dir(selected.as_u64(), dir).map(|leaf| leaf.entity_id());
+                    if let Some(neighbour) = neighbour {
+                        root.swap(selected.as_u64(), neighbour.as_u64());
+                    }
+                }
+            }
+            (ManageMode::Resize, _, Some(dir)) => {
+                // Like dragging the pane's bottom-right corner.
+                let (axis, delta) = match dir {
+                    FocusDir::Right => (Axis::Row, RESIZE_STEP),
+                    FocusDir::Left => (Axis::Row, -RESIZE_STEP),
+                    FocusDir::Down => (Axis::Col, RESIZE_STEP),
+                    FocusDir::Up => (Axis::Col, -RESIZE_STEP),
+                };
+                if let Some(root) = self.tab_mut().root.as_mut() {
+                    root.resize(selected.as_u64(), axis, delta);
+                }
             }
             (ManageMode::Select, _, Some(dir)) => {
                 let next = self.tab().root.as_ref().and_then(|root| root.focus_dir(selected.as_u64(), dir));

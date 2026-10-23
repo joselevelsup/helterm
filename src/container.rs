@@ -37,6 +37,10 @@ impl Leaf for u64 {
     }
 }
 
+/// A pane never gets smaller than this share of its split.
+const MIN_RATIO: f32 = 0.1;
+const MAX_RATIO: f32 = 1. - MIN_RATIO;
+
 /// Sway-style binary split tree. A leaf is one terminal; splits nest freely.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Node<L> {
@@ -168,6 +172,56 @@ impl<L: Leaf> Node<L> {
         }
     }
 
+    /// Grow (`delta` > 0) or shrink leaf `id` along `axis` (Row: width, Col:
+    /// height) by moving the nearest split above it that runs that way. False
+    /// if there is no such split, e.g. widening a pane that spans the width.
+    pub fn resize(&mut self, id: u64, axis: Axis, delta: f32) -> bool {
+        let Node::Split { axis: split_axis, ratio, first, second } = self else {
+            return false;
+        };
+        let in_first = first.contains(id);
+        if !in_first && !second.contains(id) {
+            return false;
+        }
+        let child = if in_first { first } else { second };
+        // The nearest split wins, so look deeper first.
+        if child.resize(id, axis, delta) {
+            return true;
+        }
+        if *split_axis != axis {
+            return false;
+        }
+        // The first child's share grows when it's the one growing.
+        let delta = if in_first { delta } else { -delta };
+        *ratio = (*ratio + delta).clamp(MIN_RATIO, MAX_RATIO);
+        true
+    }
+
+    /// Swap leaves `a` and `b`. The split sizes stay with the positions. False
+    /// unless both exist and differ.
+    pub fn swap(&mut self, a: u64, b: u64) -> bool {
+        let (Some(leaf_a), Some(leaf_b)) = (self.find_leaf(a).cloned(), self.find_leaf(b).cloned()) else {
+            return false;
+        };
+        if a == b {
+            return false;
+        }
+        // One pass, so the tree never holds two copies of the same leaf.
+        fn exchange<L: Leaf>(node: &mut Node<L>, a: u64, b: u64, leaf_a: &L, leaf_b: &L) {
+            match node {
+                Node::Leaf(l) if l.leaf_id() == a => *l = leaf_b.clone(),
+                Node::Leaf(l) if l.leaf_id() == b => *l = leaf_a.clone(),
+                Node::Leaf(_) => {}
+                Node::Split { first, second, .. } => {
+                    exchange(first, a, b, leaf_a, leaf_b);
+                    exchange(second, a, b, leaf_a, leaf_b);
+                }
+            }
+        }
+        exchange(self, a, b, &leaf_a, &leaf_b);
+        true
+    }
+
     pub fn leaves(&self) -> Vec<&L> {
         match self {
             Node::Leaf(l) => vec![l],
@@ -263,6 +317,98 @@ mod tests {
         tree.remove(1); // 2's sibling is gone entirely
         assert!(!tree.restore(&placement, 2));
         assert!(Node::Leaf(1u64).placement(1).is_none());
+    }
+
+    fn ratio_of(node: &Node<u64>) -> f32 {
+        match node {
+            Node::Split { ratio, .. } => *ratio,
+            Node::Leaf(_) => panic!("not a split"),
+        }
+    }
+
+    fn close(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1e-4
+    }
+
+    #[test]
+    fn resize_grows_the_selected_pane_and_clamps() {
+        // [1 | 2]
+        let mut tree = Node::Leaf(1u64);
+        tree.split_focused(1, Axis::Row, 2);
+        assert!(tree.resize(1, Axis::Row, 0.05));
+        assert!(close(ratio_of(&tree), 0.55)); // 1 (left) grew
+        assert!(tree.resize(2, Axis::Row, 0.05));
+        assert!(close(ratio_of(&tree), 0.5)); // 2 (right) grew back
+        for _ in 0..20 {
+            tree.resize(1, Axis::Row, 0.05);
+        }
+        assert!(close(ratio_of(&tree), MAX_RATIO));
+        // No stacked split: can't change the height.
+        assert!(!tree.resize(1, Axis::Col, 0.05));
+        assert!(!tree.resize(9, Axis::Row, 0.05)); // unknown leaf
+    }
+
+    #[test]
+    fn resize_moves_the_nearest_split_on_that_axis() {
+        // Row{ Col{1, 3}, 2 }: 3 is below 1 in the left column.
+        let mut tree = Node::Leaf(1u64);
+        tree.split_focused(1, Axis::Row, 2);
+        tree.split_focused(1, Axis::Col, 3);
+        let Node::Split { first: left, .. } = &tree else { unreachable!() };
+        assert!(close(ratio_of(left), 0.5));
+
+        // Width of 3: only the outer Row split can do that.
+        assert!(tree.resize(3, Axis::Row, 0.05));
+        assert!(close(ratio_of(&tree), 0.55));
+        // Height of 3 (bottom half of the column): the inner split's top share shrinks.
+        assert!(tree.resize(3, Axis::Col, 0.05));
+        let Node::Split { first: left, .. } = &tree else { unreachable!() };
+        assert!(close(ratio_of(left), 0.45));
+        assert!(close(ratio_of(&tree), 0.55)); // outer untouched
+
+        // [1 | [2 | 3]]: widening 3 moves the inner split, not the outer one.
+        let mut tree = Node::Leaf(1u64);
+        tree.split_focused(1, Axis::Row, 2);
+        tree.split_focused(2, Axis::Row, 3);
+        assert!(tree.resize(3, Axis::Row, 0.05));
+        assert!(close(ratio_of(&tree), 0.5));
+        let Node::Split { second: right, .. } = &tree else { unreachable!() };
+        assert!(close(ratio_of(right), 0.45));
+    }
+
+    #[test]
+    fn swap_exchanges_panes_and_keeps_sizes_in_place() {
+        // Row{ Col{1, 3}, 2 } with a wider left column.
+        let mut tree = Node::Leaf(1u64);
+        tree.split_focused(1, Axis::Row, 2);
+        tree.split_focused(1, Axis::Col, 3);
+        tree.resize(3, Axis::Row, 0.2);
+
+        assert!(tree.swap(3, 2));
+        let ids: Vec<u64> = tree.leaves().into_iter().copied().collect();
+        assert_eq!(ids, vec![1, 2, 3]); // 2 now bottom-left, 3 on the right
+        assert!(close(ratio_of(&tree), 0.7)); // the left column stays wide
+        assert_eq!(tree.focus_dir(2, FocusDir::Right).copied(), Some(3));
+
+        assert!(tree.swap(2, 3)); // and back
+        let ids: Vec<u64> = tree.leaves().into_iter().copied().collect();
+        assert_eq!(ids, vec![1, 3, 2]);
+
+        assert!(!tree.swap(1, 1));
+        assert!(!tree.swap(1, 9));
+        assert!(!Node::Leaf(1u64).swap(1, 2));
+    }
+
+    #[test]
+    fn floating_and_restoring_keeps_the_size() {
+        let mut tree = Node::Leaf(1u64);
+        tree.split_focused(1, Axis::Row, 2);
+        tree.resize(1, Axis::Row, 0.2);
+        let sized = tree.clone();
+        let placement = tree.placement(2).unwrap();
+        tree.remove(2);
+        assert!(tree.restore(&placement, 2));
+        assert_eq!(tree, sized);
     }
 
     #[test]
