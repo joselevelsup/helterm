@@ -34,6 +34,37 @@ pub enum TerminalKind {
     Command(String),
 }
 
+/// Bytes per PTY read. Large reads mean few wake-ups of the UI thread during a
+/// flood of output, which is what limits throughput (Alacritty reads big too).
+const PTY_READ_SIZE: usize = 64 * 1024;
+
+/// PTY reads that may wait to be parsed: at most ~1 MiB, then the program waits.
+const PTY_QUEUE_CHUNKS: usize = 16;
+
+/// How often the screen redraws while a flood of output is being parsed.
+const FLOOD_REDRAW: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// How long a flood of output may be parsed before the window gets a turn.
+const FLOOD_BUDGET: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Resolves on its second poll: the task goes to the back of the main thread's
+/// queue once, so pending input and drawing run before it continues. Much
+/// cheaper than a timer, which waits for the next event-loop wake-up.
+struct YieldNow(bool);
+
+impl std::future::Future for YieldNow {
+    type Output = ();
+
+    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        if self.0 {
+            return std::task::Poll::Ready(());
+        }
+        self.0 = true;
+        cx.waker().wake_by_ref();
+        std::task::Poll::Pending
+    }
+}
+
 /// Emitted once the process in the PTY has exited.
 pub struct Exited;
 
@@ -401,7 +432,10 @@ impl TerminalView {
             },
         );
 
-        let (tx, rx) = async_channel::unbounded::<Vec<u8>>();
+        // Bounded: when we fall behind, the reader waits and the PTY slows the
+        // program down, like other terminals. Unbounded, a flood (`yes`, cat of a
+        // huge file) piled up in memory and Ctrl+C had to wait for the backlog.
+        let (tx, rx) = async_channel::bounded::<Vec<u8>>(PTY_QUEUE_CHUNKS);
 
         // Closing the channel when the child exits ends the UI loop below even if
         // a background job still holds the pty open.
@@ -417,7 +451,7 @@ impl TerminalView {
         }
 
         std::thread::spawn(move || {
-            let mut buf = [0u8; 8192];
+            let mut buf = vec![0u8; PTY_READ_SIZE];
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
@@ -431,17 +465,40 @@ impl TerminalView {
         });
 
         cx.spawn(async move |this, cx| {
+            let mut busy_since = std::time::Instant::now();
+            let mut last_redraw = std::time::Instant::now();
             while let Ok(mut bytes) = rx.recv().await {
-                // Coalesce everything already queued into one parse + one redraw.
-                while let Ok(more) = rx.try_recv() {
-                    bytes.extend_from_slice(&more);
+                // Coalesce what's queued into one parse + one redraw, capped so a
+                // flood can't make one batch run forever.
+                for _ in 0..PTY_QUEUE_CHUNKS {
+                    match rx.try_recv() {
+                        Ok(more) => bytes.extend_from_slice(&more),
+                        Err(_) => break,
+                    }
+                }
+                // Caught up: redraw now. In a flood, redraw at most every
+                // FLOOD_REDRAW so drawing doesn't eat the time parsing needs.
+                let redraw = rx.is_empty() || last_redraw.elapsed() >= FLOOD_REDRAW;
+                if redraw {
+                    last_redraw = std::time::Instant::now();
                 }
                 let fed = this.update(cx, |view, cx| {
                     view.feed(&bytes);
-                    cx.notify();
+                    if redraw {
+                        cx.notify();
+                    }
                 });
                 if fed.is_err() {
                     return;
+                }
+                // In a flood the queue never empties and this loop would hog the
+                // main thread. After a time budget, step back once so the window
+                // can draw and handle keys (Ctrl+C!), then carry on at full speed.
+                if rx.is_empty() {
+                    busy_since = std::time::Instant::now();
+                } else if busy_since.elapsed() >= FLOOD_BUDGET {
+                    YieldNow(false).await;
+                    busy_since = std::time::Instant::now();
                 }
             }
             this.update(cx, |_, cx| cx.emit(Exited)).ok();
@@ -845,10 +902,15 @@ fn shape_piece(
     window: &mut Window,
     texts: &mut Vec<(usize, usize, ShapedLine)>,
 ) {
-    let text = std::mem::take(piece);
+    let mut text = std::mem::take(piece);
     let Some(style) = style else { return };
     let decorated = style.flags.intersects(Flags::ALL_UNDERLINES | Flags::STRIKEOUT);
-    if text.trim_end().is_empty() && !decorated || style.fg.a == 0. {
+    if !decorated {
+        // Trailing spaces draw nothing; shaping them was most of the cost for
+        // short lines like `seq` output (backgrounds are painted separately).
+        text.truncate(text.trim_end_matches(' ').len());
+    }
+    if text.is_empty() || style.fg.a == 0. {
         return;
     }
     let run = style.run(text.len(), font);
