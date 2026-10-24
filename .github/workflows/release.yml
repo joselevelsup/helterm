@@ -55,5 +55,5 @@ jobs:
         if: github.ref_type != 'tag'
         uses: actions/upload-artifact@v4
         with:
-          name: vibe_term-linux-x86_64
+          name: helterm-linux-x86_64
           path: dist/*.tar.gz*

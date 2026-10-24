@@ -1,4 +1,4 @@
-//! User configuration: `~/.config/vibe_term/config.toml` (or `$XDG_CONFIG_HOME`).
+//! User configuration: `~/.config/helterm/config.toml` (or `$XDG_CONFIG_HOME`).
 //! Every setting is optional; bad entries are skipped with a warning instead of
 //! failing the whole file.
 
@@ -265,17 +265,17 @@ fn normalize(key: &str) -> String {
 /// Written on first start: every setting with its default value.
 const DEFAULT_CONFIG: &str = include_str!("../config.example.toml");
 
-/// The config file: `$XDG_CONFIG_HOME/vibe_term/config.toml`, else `~/.config/...`.
+/// The config file: `$XDG_CONFIG_HOME/helterm/config.toml`, else `~/.config/...`.
 pub fn path() -> Option<PathBuf> {
     xdg_file(std::env::var_os("XDG_CONFIG_HOME"), std::env::home_dir(), ".config", "config.toml")
 }
 
-/// Saved workspaces: `$XDG_STATE_HOME/vibe_term/workspaces.toml`, else `~/.local/state/...`.
+/// Saved workspaces: `$XDG_STATE_HOME/helterm/workspaces.toml`, else `~/.local/state/...`.
 pub fn state_path() -> Option<PathBuf> {
     xdg_file(std::env::var_os("XDG_STATE_HOME"), std::env::home_dir(), ".local/state", "workspaces.toml")
 }
 
-/// `$XDG_*/vibe_term/<file>`, else `~/<fallback>/vibe_term/<file>`. Per the XDG
+/// `$XDG_*/helterm/<file>`, else `~/<fallback>/helterm/<file>`. Per the XDG
 /// spec an empty or relative variable is ignored, so files never land relative
 /// to wherever the app was launched from.
 fn xdg_file(xdg: Option<std::ffi::OsString>, home: Option<PathBuf>, fallback: &str, file: &str) -> Option<PathBuf> {
@@ -283,7 +283,7 @@ fn xdg_file(xdg: Option<std::ffi::OsString>, home: Option<PathBuf>, fallback: &s
         .map(PathBuf::from)
         .filter(|dir| dir.is_absolute())
         .or_else(|| home.map(|home| home.join(fallback)))?;
-    Some(base.join("vibe_term").join(file))
+    Some(base.join("helterm").join(file))
 }
 
 /// Create the config file with defaults; never overwrites an existing one.
@@ -541,22 +541,22 @@ mod tests {
     fn config_path_follows_xdg_and_ignores_bad_values() {
         let home = Some(PathBuf::from("/home/u"));
         let at = |xdg: Option<&str>| xdg_file(xdg.map(Into::into), home.clone(), ".config", "config.toml").unwrap();
-        assert_eq!(at(None), PathBuf::from("/home/u/.config/vibe_term/config.toml"));
-        assert_eq!(at(Some("/xdg")), PathBuf::from("/xdg/vibe_term/config.toml"));
-        assert_eq!(at(Some("")), PathBuf::from("/home/u/.config/vibe_term/config.toml"));
-        assert_eq!(at(Some("rel/dir")), PathBuf::from("/home/u/.config/vibe_term/config.toml"));
+        assert_eq!(at(None), PathBuf::from("/home/u/.config/helterm/config.toml"));
+        assert_eq!(at(Some("/xdg")), PathBuf::from("/xdg/helterm/config.toml"));
+        assert_eq!(at(Some("")), PathBuf::from("/home/u/.config/helterm/config.toml"));
+        assert_eq!(at(Some("rel/dir")), PathBuf::from("/home/u/.config/helterm/config.toml"));
         assert_eq!(xdg_file(None, None, ".config", "config.toml"), None);
         assert_eq!(
             xdg_file(None, home.clone(), ".local/state", "workspaces.toml").unwrap(),
-            PathBuf::from("/home/u/.local/state/vibe_term/workspaces.toml")
+            PathBuf::from("/home/u/.local/state/helterm/workspaces.toml")
         );
     }
 
     #[test]
     fn first_start_writes_defaults_but_never_overwrites() {
-        let dir = std::env::temp_dir().join(format!("vibe_term_cfg_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("helterm_cfg_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let path = dir.join("vibe_term").join("config.toml");
+        let path = dir.join("helterm").join("config.toml");
 
         write_default(&path).unwrap();
         let written = std::fs::read_to_string(&path).unwrap();

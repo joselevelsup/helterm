@@ -11,13 +11,13 @@ use crate::workspace::Workspace;
 
 /// Must match the .desktop file name and icon name in packaging/, so launchers
 /// and docks can pair the window with its icon.
-const APP_ID: &str = "io.github.joselevelsup.VibeTerm";
+const APP_ID: &str = "io.github.joselevelsup.Helterm";
 
 fn main() {
     Application::new().run(|cx: &mut App| {
         let config = Config::load();
         for warning in &config.warnings {
-            eprintln!("vibe_term config: {warning}");
+            eprintln!("helterm config: {warning}");
         }
         cx.bind_keys(config.bindings());
         cx.set_global(config);
@@ -28,7 +28,7 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 app_id: Some(APP_ID.to_owned()),
                 titlebar: Some(TitlebarOptions {
-                    title: Some("Vibe Term".into()),
+                    title: Some("Helterm".into()),
                     ..Default::default()
                 }),
                 ..Default::default()

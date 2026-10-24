@@ -1,9 +1,9 @@
 [package]
-name = "vibe_term"
+name = "helterm"
 version = "0.1.0"
 edition = "2021"
-description = "A project terminal: tiled terminals and Helix editors, grouped into workspaces"
-repository = "https://github.com/joselevelsup/vibe_term"
+description = "A Helix-centric project workspace manager: each workspace is a project folder with its editors, shells and tools arranged around it"
+repository = "https://github.com/joselevelsup/helterm"
 license = "MIT"
 
 [dependencies]

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build the release archive the GitHub workflow publishes:
-#   dist/vibe_term-<version>-<arch>-linux.tar.gz and a .sha256 next to it.
+#   dist/helterm-<version>-<arch>-linux.tar.gz and a .sha256 next to it.
 # Runs the same locally and in CI. With RELEASE_TAG set (CI sets it from the
 # git tag), it refuses to build when the tag doesn't match Cargo.toml.
 set -euo pipefail
@@ -14,11 +14,11 @@ fi
 
 cargo build --release --locked
 
-name="vibe_term-$version-$(uname -m)-linux"
+name="helterm-$version-$(uname -m)-linux"
 stage="dist/$name"
 rm -rf "$stage" "dist/$name.tar.gz" "dist/$name.tar.gz.sha256"
 mkdir -p "$stage"
-install -m755 target/release/vibe_term "$stage/"
+install -m755 target/release/helterm "$stage/"
 install -m755 packaging/install.sh "$stage/"
 cp packaging/*.desktop packaging/*.svg config.example.toml README.md "$stage/"
 if [ -f LICENSE ]; then cp LICENSE "$stage/"; fi

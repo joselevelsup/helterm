@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Helterm
+GenericName=Terminal
+Comment=Helix-centric project workspace manager
+Exec=helterm
+Icon=io.github.joselevelsup.Helterm
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=terminal;shell;helix;editor;workspace;
+StartupNotify=true
+StartupWMClass=io.github.joselevelsup.Helterm

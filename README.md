@@ -1,4 +1,4 @@
-# Vibe Term
+# Helterm
 
 > **Heads up:** this is personal software. I built it for my own use, the way I
 > like to work. You're welcome to use it at your own leisure, but expect rough
@@ -10,17 +10,21 @@ Because I wanted to, and therefore I did.
 
 ## What it is
 
-A project terminal for Linux where terminal editors are first-class citizens.
-Instead of one shell in one window, you get:
+Helterm is a Helix-centric project workspace manager: each workspace is a
+project folder with its editors, shells and tools arranged around it. It isn't
+trying to be a plain terminal emulator or a multiplexer; the terminal and the
+panes are just how the project is laid out.
 
-- **Workspaces**: one per project folder, listed in a sidebar (shrinkable to
-  Slack-style initials). The list is saved and reopened on the next start.
-- **Tabs** inside each workspace. The tab bar only shows once there are two.
-- **Manual, Sway-style splits**: every tab is a tree of containers, each one a
-  terminal or a [Helix](https://helix-editor.com) editor.
-- **A file explorer** you can toggle next to any editor: open, create, rename
-  and delete files from the keyboard.
-- **Maximize** a container within its tab, or **float** a terminal over it.
+- **Workspaces are projects**: one per folder, listed in a sidebar (shrinkable
+  to Slack-style initials). The list is saved and reopened on the next start.
+- **[Helix](https://helix-editor.com) is first-class**: editor containers open
+  Helix in the project, with a file explorer you can toggle next to them to
+  open, create, rename and delete files from the keyboard.
+- **Tools around the editor**: shells in manual, Sway-style splits, tabs per
+  workspace, and floating terminals, including ones that run a command on a
+  key (lazygit on `Alt+G`, say).
+- **Arrange it your way**: management mode to select and resize containers,
+  maximize one, scroll back with a Helix-style copy mode.
 - **A config file** for fonts, colors and every keybinding.
 
 Built in Rust with [GPUI](https://crates.io/crates/gpui) (from the Zed editor)
@@ -29,18 +33,18 @@ for terminal emulation.
 
 ## Install
 
-Download `vibe_term-<version>-x86_64-linux.tar.gz` from the
-[releases page](https://github.com/joselevelsup/vibe_term/releases), then:
+Download `helterm-<version>-x86_64-linux.tar.gz` from the
+[releases page](https://github.com/joselevelsup/helterm/releases), then:
 
 ```sh
-sha256sum -c vibe_term-*.tar.gz.sha256   # optional: check the download
-tar -xzf vibe_term-*-x86_64-linux.tar.gz
-cd vibe_term-*-x86_64-linux
+sha256sum -c helterm-*.tar.gz.sha256   # optional: check the download
+tar -xzf helterm-*-x86_64-linux.tar.gz
+cd helterm-*-x86_64-linux
 ./install.sh                # into ~/.local (PREFIX=/usr/local sudo ./install.sh for all users)
 ./install.sh --uninstall    # to remove it again
 ```
 
-It shows up in your app launcher as **Vibe Term**.
+It shows up in your app launcher as **Helterm**.
 
 **Requirements:** x86_64 Linux with glibc 2.35 or newer (Fedora, Arch, Ubuntu
 22.04+, Debian 12+, ...) and a Vulkan-capable GPU driver. Editor containers
@@ -49,13 +53,13 @@ need Helix (`hx`) on your `PATH`; plain terminals work without it.
 ### From source
 
 ```sh
-git clone https://github.com/joselevelsup/vibe_term && cd vibe_term
+git clone https://github.com/joselevelsup/helterm && cd helterm
 ./install.sh                # builds the release binary, then installs it (same as above)
 ./install.sh --uninstall    # to remove it again
 ```
 
 Run `./install.sh` again after pulling changes to update; it tells you when a
-running Vibe Term needs a restart. To try it without installing:
+running Helterm needs a restart. To try it without installing:
 `cargo run --release`.
 
 Needs stable Rust and the X11/Wayland development headers, e.g. on Fedora
@@ -74,11 +78,11 @@ Needs stable Rust and the X11/Wayland development headers, e.g. on Fedora
 
 ## Configuration
 
-The config file lives at `$XDG_CONFIG_HOME/vibe_term/config.toml`, usually
-`~/.config/vibe_term/config.toml`. Vibe Term creates it on first start with
+The config file lives at `$XDG_CONFIG_HOME/helterm/config.toml`, usually
+`~/.config/helterm/config.toml`. Helterm creates it on first start with
 every setting at its default (the same content as
 [`config.example.toml`](config.example.toml)) and never overwrites it after
-that. Restart Vibe Term to apply changes.
+that. Restart Helterm to apply changes.
 
 Every setting is optional: anything you delete goes back to its default.
 Mistakes (unknown names, bad colors, invalid keys, a key bound to two actions)
@@ -123,11 +127,11 @@ A key can belong to only one action. If two actions share a key, a key you set
 yourself wins over a default; between two of yours, the one listed first in
 `config.example.toml` keeps it, then `[[floating_commands]]` in file order.
 
-Other files Vibe Term keeps:
+Other files Helterm keeps:
 
 | File | What |
 | ---- | ---- |
-| `$XDG_STATE_HOME/vibe_term/workspaces.toml` (usually `~/.local/state/vibe_term/`) | The saved workspace list (folders only, not layouts). |
+| `$XDG_STATE_HOME/helterm/workspaces.toml` (usually `~/.local/state/helterm/`) | The saved workspace list (folders only, not layouts). |
 
 ## Default keybindings
 
@@ -145,7 +149,7 @@ These are the defaults. The **Config name** column is what to use under
 | `Alt+B` | Shrink / enlarge the workspace bar | `toggle_sidebar` |
 
 > COSMIC, GNOME and KDE use `Alt+Tab` / `Alt+Shift+Tab` to switch windows, so
-> Vibe Term never sees them there. Free them in your desktop's keyboard
+> Helterm never sees them there. Free them in your desktop's keyboard
 > settings, or rebind `next_workspace` / `prev_workspace`.
 
 ### Tabs

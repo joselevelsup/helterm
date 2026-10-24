@@ -1,7 +1,7 @@
-# vibe_term configuration, created with the defaults on first start at
-# $XDG_CONFIG_HOME/vibe_term/config.toml (usually ~/.config/vibe_term/).
+# Helterm configuration, created with the defaults on first start at
+# $XDG_CONFIG_HOME/helterm/config.toml (usually ~/.config/helterm/).
 # Change what you like; every setting is optional and anything you delete
-# goes back to its default. Restart vibe_term to apply changes.
+# goes back to its default. Restart Helterm to apply changes.
 
 [font]
 family = "JetBrainsMono Nerd Font"

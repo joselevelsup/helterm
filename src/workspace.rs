@@ -1307,7 +1307,7 @@ impl Workspace {
                         .flex_1()
                         .flex()
                         .flex_col()
-                        .child(div().text_color(rgb(t.warning)).child("vibe_term found problems:"))
+                        .child(div().text_color(rgb(t.warning)).child("Helterm found problems:"))
                         .children(lines.into_iter().map(|w| div().text_color(rgb(t.text)).child(format!("• {w}")))),
                 )
                 .child(
@@ -1501,8 +1501,8 @@ impl Render for Workspace {
             self.focus_active_tab(window, cx);
         }
         let title = match self.projects.get(self.active) {
-            Some(project) => format!("{} - Vibe Term", project.name()),
-            None => "Vibe Term".to_owned(),
+            Some(project) => format!("{} - Helterm", project.name()),
+            None => "Helterm".to_owned(),
         };
         if title != self.window_title {
             window.set_window_title(&title);
@@ -1648,9 +1648,9 @@ mod tests {
 
     #[test]
     fn saved_workspaces_round_trip_in_order() {
-        let dir = std::env::temp_dir().join(format!("vibe_term_state_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("helterm_state_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let path = dir.join("vibe_term").join("workspaces.toml");
+        let path = dir.join("helterm").join("workspaces.toml");
 
         assert_eq!(load_saved(&path).unwrap(), Vec::<PathBuf>::new()); // first start
         let folders = vec![PathBuf::from("/home/u/b"), PathBuf::from("/home/u/a"), PathBuf::from("/home/u")];
