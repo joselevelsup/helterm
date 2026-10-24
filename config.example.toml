@@ -72,6 +72,9 @@ float_focused = "alt-shift-f"
 copy = "ctrl-shift-c"   # copy the selection (selecting also fills the middle-click clipboard)
 paste = "ctrl-shift-v"
 copy_mode = "alt-v"      # Helix keys: j/k scroll, x/v select, y copy, Esc leave
+zoom_in = "alt-+"        # font size of the focused terminal
+zoom_out = "alt--"
+zoom_reset = "alt-0"
 
 # Floating terminals that run a command. Press the key to open one, press it
 # again to hide / show it (it keeps running); it closes when the command exits.

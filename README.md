@@ -48,7 +48,9 @@ It shows up in your app launcher as **Helterm**.
 
 **Requirements:** x86_64 Linux with glibc 2.35 or newer (Fedora, Arch, Ubuntu
 22.04+, Debian 12+, ...) and a Vulkan-capable GPU driver. Editor containers
-need Helix (`hx`) on your `PATH`; plain terminals work without it.
+need Helix (`hx`) on your `PATH`; plain terminals work without it. Editors
+start through your shell (`$SHELL -l -i -c hx`) in the workspace folder, so
+tools from mise, asdf, nvm, ... (and the LSPs they provide) are found.
 
 ### From source
 
@@ -189,6 +191,7 @@ only one shows at a time. Every other key goes to the focused terminal or editor
 | `Ctrl+Shift+V` | Paste | `paste` |
 | `Alt+V` | Toggle copy mode (see below) | `copy_mode` |
 | Middle-click | Paste the last selection (Linux "primary" clipboard) | |
+| `Alt++` / `Alt+-` / `Alt+0` | Zoom the focused terminal in / out / back to the configured size | `zoom_in` / `zoom_out` / `zoom_reset` |
 
 Selecting also fills the middle-click clipboard. Clicking or typing clears the
 selection. Pastes into programs that support it (shells, Helix) are bracketed,

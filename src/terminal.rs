@@ -20,7 +20,7 @@ use gpui::{
     TextRun, UnderlineStyle, Window, div, point, prelude::*, px, size,
 };
 
-actions!(terminal, [Copy, Paste, CopyMode]);
+actions!(terminal, [Copy, Paste, CopyMode, ZoomIn, ZoomOut, ZoomReset]);
 use crate::config::{Config, TermColors};
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 
@@ -163,6 +163,8 @@ pub struct TerminalView {
     /// Fraction of a line left over from smooth (touchpad) scrolling.
     scroll_remainder: f32,
     copy_mode: CopyModeState,
+    /// Points added to the configured font size (Alt++ / Alt+-), per pane.
+    zoom: f32,
 }
 
 impl EventEmitter<Exited> for TerminalView {}
@@ -401,16 +403,18 @@ impl TerminalView {
             })
             .expect("failed to open pty");
 
+        // A login + interactive shell loads the user's PATH (Homebrew,
+        // ~/.local/bin, ...), version managers (mise, asdf: Helix needs them to
+        // find LSPs like `gleam lsp`) and aliases, and handles pipes and arguments.
+        let through_shell = |command: &str| {
+            let mut cmd = CommandBuilder::new(CommandBuilder::new_default_prog().get_shell());
+            cmd.args(["-l", "-i", "-c", command]);
+            cmd
+        };
         let mut cmd = match &kind {
-            TerminalKind::Editor => CommandBuilder::new("hx"),
+            TerminalKind::Editor => through_shell("hx"),
             TerminalKind::Terminal => CommandBuilder::new_default_prog(),
-            TerminalKind::Command(command) => {
-                // A login + interactive shell loads the user's PATH (Homebrew,
-                // ~/.local/bin, ...) and aliases, and handles pipes and arguments.
-                let mut cmd = CommandBuilder::new(CommandBuilder::new_default_prog().get_shell());
-                cmd.args(["-l", "-i", "-c", command.as_str()]);
-                cmd
-            }
+            TerminalKind::Command(command) => through_shell(command),
         };
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
@@ -521,6 +525,7 @@ impl TerminalView {
             selecting: false,
             scroll_remainder: 0.,
             copy_mode: CopyModeState::default(),
+            zoom: 0.,
         }
     }
 
@@ -594,6 +599,17 @@ impl TerminalView {
             self.copy_mode = CopyModeState::default();
             self.term.toggle_vi_mode();
         }
+        cx.notify();
+    }
+
+    /// Change the zoom by `delta` points (None: reset), keeping the font size
+    /// within the range the config allows.
+    fn zoom_by(&mut self, delta: Option<f32>, cx: &mut Context<Self>) {
+        let base = cx.global::<Config>().font_size;
+        self.zoom = match delta {
+            Some(delta) => (base + self.zoom + delta).clamp(6., 72.) - base,
+            None => 0.,
+        };
         cx.notify();
     }
 
@@ -711,7 +727,9 @@ impl Focusable for TerminalView {
 
 /// Translate a gpui keystroke into PTY bytes. Covers what shells and Helix need
 /// day to day; exotic combos are dropped rather than sent as garbage.
-fn keystroke_to_bytes(ks: &Keystroke) -> Option<Vec<u8>> {
+/// `app_cursor`: the program asked for application cursor keys (DECCKM), as
+/// ncurses programs like htop do; they only understand arrows as `ESC O A`.
+fn keystroke_to_bytes(ks: &Keystroke, app_cursor: bool) -> Option<Vec<u8>> {
     let key = ks.key.as_str();
     let mods = &ks.modifiers;
 
@@ -743,7 +761,7 @@ fn keystroke_to_bytes(ks: &Keystroke) -> Option<Vec<u8>> {
     // Alt-modified keys are sent as ESC + key, unless a workspace binding
     // (alt-enter etc.) already consumed the keystroke.
     if mods.alt && !mods.control && !mods.platform {
-        if let Some(seq) = named_key_sequence(key) {
+        if let Some(seq) = named_key_sequence(key, app_cursor) {
             return Some([vec![0x1b], seq].concat());
         }
         if let Some(c) = ks.key_char.as_deref().and_then(|s| s.chars().next()) {
@@ -761,7 +779,7 @@ fn keystroke_to_bytes(ks: &Keystroke) -> Option<Vec<u8>> {
     if mods.shift && key == "tab" {
         return Some(b"\x1b[Z".to_vec());
     }
-    if let Some(seq) = named_key_sequence(key) {
+    if let Some(seq) = named_key_sequence(key, app_cursor) {
         return Some(seq);
     }
 
@@ -776,7 +794,21 @@ fn keystroke_to_bytes(ks: &Keystroke) -> Option<Vec<u8>> {
     }
 }
 
-fn named_key_sequence(key: &str) -> Option<Vec<u8>> {
+fn named_key_sequence(key: &str, app_cursor: bool) -> Option<Vec<u8>> {
+    if app_cursor {
+        let seq: Option<&[u8]> = match key {
+            "up" => Some(b"\x1bOA"),
+            "down" => Some(b"\x1bOB"),
+            "right" => Some(b"\x1bOC"),
+            "left" => Some(b"\x1bOD"),
+            "home" => Some(b"\x1bOH"),
+            "end" => Some(b"\x1bOF"),
+            _ => None,
+        };
+        if let Some(seq) = seq {
+            return Some(seq.to_vec());
+        }
+    }
     let seq: &[u8] = match key {
         "enter" => b"\r",
         "escape" => b"\x1b",
@@ -793,6 +825,18 @@ fn named_key_sequence(key: &str) -> Option<Vec<u8>> {
         "pagedown" => b"\x1b[6~",
         "insert" => b"\x1b[2~",
         "delete" => b"\x1b[3~",
+        "f1" => b"\x1bOP",
+        "f2" => b"\x1bOQ",
+        "f3" => b"\x1bOR",
+        "f4" => b"\x1bOS",
+        "f5" => b"\x1b[15~",
+        "f6" => b"\x1b[17~",
+        "f7" => b"\x1b[18~",
+        "f8" => b"\x1b[19~",
+        "f9" => b"\x1b[20~",
+        "f10" => b"\x1b[21~",
+        "f11" => b"\x1b[23~",
+        "f12" => b"\x1b[24~",
         _ => return None,
     };
     Some(seq.to_vec())
@@ -801,7 +845,7 @@ fn named_key_sequence(key: &str) -> Option<Vec<u8>> {
 // Rendering -------------------------------------------------------------------
 
 /// Everything about a cell that affects how its run is shaped and painted.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct CellStyle {
     fg: Hsla,
     bg: Option<Hsla>,
@@ -839,6 +883,11 @@ impl CellStyle {
             flags: cell.flags & STYLE_FLAGS,
             underline_color: cell.underline_color().map(|c| color_of(c, colors)),
         }
+    }
+
+    /// Underlined or struck through: drawn even on a space.
+    fn decorated(&self) -> bool {
+        self.flags.intersects(Flags::ALL_UNDERLINES | Flags::STRIKEOUT)
     }
 
     /// Same look for the glyphs (background aside, it's painted separately).
@@ -887,36 +936,39 @@ struct TerminalPrepaint {
     cell_width: Pixels,
 }
 
-/// Shape one same-style piece of a row, skipping pieces with nothing to draw.
-/// Shaping per piece (not per row) lets gpui's layout cache reuse every piece
-/// that didn't change, e.g. Helix's code text when only line numbers change.
-#[allow(clippy::too_many_arguments)]
-fn shape_piece(
-    piece: &mut String,
-    style: Option<CellStyle>,
-    row: usize,
+/// A stretch of a row shaped in one go: its first column, its text and the
+/// style runs inside it (byte length, style).
+#[derive(Debug, PartialEq)]
+struct Piece {
     start: usize,
-    font: &Font,
-    font_size: Pixels,
-    cell_width: Pixels,
-    window: &mut Window,
-    texts: &mut Vec<(usize, usize, ShapedLine)>,
-) {
-    let mut text = std::mem::take(piece);
-    let Some(style) = style else { return };
-    let decorated = style.flags.intersects(Flags::ALL_UNDERLINES | Flags::STRIKEOUT);
-    if !decorated {
-        // Trailing spaces draw nothing; shaping them was most of the cost for
-        // short lines like `seq` output (backgrounds are painted separately).
-        text.truncate(text.trim_end_matches(' ').len());
+    text: String,
+    styles: Vec<(usize, CellStyle)>,
+}
+
+/// Split a row into "words": stretches without plain spaces. A word is shaped
+/// as one line, so ligatures (`->`, `!=`, ...) form even when its characters
+/// have different colors, and words that didn't change since the last frame
+/// come straight from gpui's layout cache. Plain spaces draw nothing (their
+/// backgrounds are rectangles), so they're skipped; underlined or struck
+/// spaces stay so their decoration is drawn. Wide-char spacer cells are plain
+/// spaces too, so the next word starts at its real column.
+fn row_pieces(cells: &[(char, CellStyle)]) -> Vec<Piece> {
+    let mut pieces = Vec::new();
+    let mut current: Option<Piece> = None;
+    for (col, &(c, style)) in cells.iter().enumerate() {
+        if c == ' ' && !style.decorated() {
+            pieces.extend(current.take());
+            continue;
+        }
+        let piece = current.get_or_insert_with(|| Piece { start: col, text: String::new(), styles: vec![] });
+        piece.text.push(c);
+        match piece.styles.last_mut() {
+            Some((len, last)) if last.same_text(&style) => *len += c.len_utf8(),
+            _ => piece.styles.push((c.len_utf8(), style)),
+        }
     }
-    if text.is_empty() || style.fg.a == 0. {
-        return;
-    }
-    let run = style.run(text.len(), font);
-    // force_width snaps every glyph to the cell grid.
-    let line = window.text_system().shape_line(text.into(), font_size, &[run], Some(cell_width));
-    texts.push((row, start, line));
+    pieces.extend(current);
+    pieces
 }
 
 impl IntoElement for TerminalElement {
@@ -998,8 +1050,7 @@ impl Element for TerminalElement {
         // cursorline / cursorcolumn (Helix) doesn't force every row to be reshaped.
         let mut texts = Vec::new();
         let mut backgrounds = Vec::new();
-        let mut piece = String::new();
-        let (mut piece_start, mut piece_style) = (0usize, None::<CellStyle>);
+        let mut row_cells: Vec<(char, CellStyle)> = Vec::with_capacity(columns);
         let (mut bg_start, mut bg) = (0usize, None::<Hsla>);
         let (mut row, mut col) = (0usize, 0usize);
 
@@ -1014,18 +1065,19 @@ impl Element for TerminalElement {
                 }
                 (bg_start, bg) = (col, style.bg);
             }
-            if !piece_style.is_some_and(|p| p.same_text(&style)) {
-                shape_piece(&mut piece, piece_style, row, piece_start, &font, font_size, cell_width, window, &mut texts);
-                (piece_start, piece_style) = (col, Some(style));
-            }
-            // Wide-char spacer cells stay as ' ' so every cell maps to one glyph.
-            piece.push(cell.c);
+            row_cells.push((cell.c, style));
             col += 1;
             if col == columns {
                 if let Some(color) = bg.take() {
                     backgrounds.push((row, bg_start, col - bg_start, color));
                 }
-                shape_piece(&mut piece, piece_style.take(), row, piece_start, &font, font_size, cell_width, window, &mut texts);
+                for piece in row_pieces(&row_cells) {
+                    let runs: Vec<TextRun> = piece.styles.iter().map(|(len, style)| style.run(*len, &font)).collect();
+                    // force_width snaps every glyph to the cell grid.
+                    let line = window.text_system().shape_line(piece.text.into(), font_size, &runs, Some(cell_width));
+                    texts.push((row, piece.start, line));
+                }
+                row_cells.clear();
                 (row, col) = (row + 1, 0);
             }
         }
@@ -1120,7 +1172,7 @@ impl Render for TerminalView {
             (ui.accent, ui.background)
         };
         let config = cx.global::<Config>();
-        let (family, size) = (config.font_family.clone(), config.font_size);
+        let (family, size) = (config.font_family.clone(), config.font_size + self.zoom);
         let (background, border) = (
             config.terminal.background,
             if focused { config.ui.accent } else { config.ui.element },
@@ -1141,6 +1193,9 @@ impl Render for TerminalView {
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::toggle_copy_mode))
+            .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.zoom_by(Some(1.), cx)))
+            .on_action(cx.listener(|this, _: &ZoomOut, _, cx| this.zoom_by(Some(-1.), cx)))
+            .on_action(cx.listener(|this, _: &ZoomReset, _, cx| this.zoom_by(None, cx)))
             .on_scroll_wheel(cx.listener(Self::scroll_wheel))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
                 if this.in_copy_mode() {
@@ -1157,7 +1212,8 @@ impl Render for TerminalView {
                     cx.notify();
                     return;
                 }
-                if let Some(bytes) = keystroke_to_bytes(&event.keystroke) {
+                let app_cursor = this.term.mode().contains(TermMode::APP_CURSOR);
+                if let Some(bytes) = keystroke_to_bytes(&event.keystroke, app_cursor) {
                     // Typing clears the selection and jumps back to the bottom,
                     // like other terminals.
                     let scrolled = this.term.grid().display_offset() != 0;
@@ -1241,6 +1297,45 @@ mod tests {
         // Outside the grid clamps to the edges (drags past the pane).
         assert_eq!(cell_at(-50., -50., cell, (80, 24)), (0, 0, Side::Left));
         assert_eq!(cell_at(5000., 5000., cell, (80, 24)), (79, 23, Side::Right));
+    }
+
+    fn style(fg: u32, flags: Flags) -> CellStyle {
+        CellStyle { fg: rgb(fg).into(), bg: None, flags, underline_color: None }
+    }
+
+    fn cells(text: &str, styles: &[CellStyle]) -> Vec<(char, CellStyle)> {
+        text.chars().zip(styles.iter().copied().cycle()).collect()
+    }
+
+    #[test]
+    fn rows_split_into_words_that_keep_ligatures_together() {
+        let (white, red, blue) = (style(0xffffff, Flags::empty()), style(0xff0000, Flags::empty()), style(0x0000ff, Flags::empty()));
+
+        // `a->b c`: '-' and '>' colored differently still shape as one piece.
+        let row = vec![(' ', white), ('a', white), ('-', red), ('>', blue), ('b', white), (' ', white), ('c', white)];
+        let pieces = row_pieces(&row);
+        assert_eq!(pieces.len(), 2);
+        assert_eq!((pieces[0].start, pieces[0].text.as_str()), (1, "a->b"));
+        assert_eq!(pieces[0].styles, vec![(1, white), (1, red), (1, blue), (1, white)]);
+        assert_eq!((pieces[1].start, pieces[1].text.as_str()), (6, "c"));
+
+        // Same-colored neighbours merge into one run; blank rows draw nothing.
+        let pieces = row_pieces(&cells("  fn main  ", &[white]));
+        let words: Vec<_> = pieces.iter().map(|p| (p.start, p.text.as_str(), p.styles.len())).collect();
+        assert_eq!(words, vec![(2, "fn", 1), (5, "main", 1)]);
+        assert!(row_pieces(&cells("     ", &[white])).is_empty());
+
+        // An underlined space (e.g. Helix's error underline) stays in, so it's drawn.
+        let under = style(0xffffff, Flags::UNDERCURL);
+        let pieces = row_pieces(&cells("a b", &[under]));
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(pieces[0].text, "a b");
+
+        // Wide chars: the spacer cell splits, so the next word lands on its real column.
+        let pieces = row_pieces(&[('中', white), (' ', white), ('x', white)]);
+        let words: Vec<_> = pieces.iter().map(|p| (p.start, p.text.as_str())).collect();
+        assert_eq!(words, vec![(0, "中"), (2, "x")]);
+        assert_eq!(pieces[0].styles, vec![(3, white)]); // byte length of '中'
     }
 
     #[test]
@@ -1408,6 +1503,27 @@ mod tests {
         assert_eq!(press(&mut term, st, "escape"), CopyModeKey::Handled);
         assert!(term.selection.is_none());
         assert_eq!(press(&mut term, st, "escape"), CopyModeKey::Exit);
+    }
+
+    #[test]
+    fn keys_follow_application_cursor_mode() {
+        let key = |k: &str, app| keystroke_to_bytes(&Keystroke::parse(k).unwrap(), app).unwrap();
+        assert_eq!(key("up", false), b"\x1b[A");
+        assert_eq!(key("up", true), b"\x1bOA"); // htop & other ncurses programs
+        assert_eq!(key("end", true), b"\x1bOF");
+        assert_eq!(key("pagedown", true), b"\x1b[6~"); // not affected by the mode
+        assert_eq!(key("alt-left", true), b"\x1b\x1bOD");
+        assert_eq!(key("f1", false), b"\x1bOP");
+        assert_eq!(key("f10", false), b"\x1b[21~");
+        assert_eq!(key("k", true), b"k");
+
+        // htop turns the mode on with ESC[?1h.
+        let mut term = term_with_lines(0);
+        let mut parser: Processor = Processor::new();
+        for b in b"\x1b[?1h" {
+            parser.advance(&mut term, *b);
+        }
+        assert!(term.mode().contains(TermMode::APP_CURSOR));
     }
 
     #[test]

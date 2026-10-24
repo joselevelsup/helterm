@@ -134,6 +134,9 @@ const ACTIONS: &[(&str, &str, fn() -> Box<dyn Action>)] = &[
     ("copy", "ctrl-shift-c", || Box::new(crate::terminal::Copy)),
     ("paste", "ctrl-shift-v", || Box::new(crate::terminal::Paste)),
     ("copy_mode", "alt-v", || Box::new(crate::terminal::CopyMode)),
+    ("zoom_in", "alt-+", || Box::new(crate::terminal::ZoomIn)),
+    ("zoom_out", "alt--", || Box::new(crate::terminal::ZoomOut)),
+    ("zoom_reset", "alt-0", || Box::new(crate::terminal::ZoomReset)),
 ];
 
 pub struct Config {
