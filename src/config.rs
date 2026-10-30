@@ -144,6 +144,8 @@ pub struct Config {
     pub terminal: TermColors,
     pub font_family: SharedString,
     pub font_size: f32,
+    /// File explorer on the left of its editor instead of the right.
+    pub explorer_left: bool,
     /// Action name -> key strings (validated). Empty means unbound.
     keys: HashMap<&'static str, Vec<String>>,
     /// Floating terminals that run a command, each on its own key.
@@ -161,6 +163,7 @@ impl Default for Config {
             terminal: TermColors::default(),
             font_family: "JetBrainsMono Nerd Font".into(),
             font_size: 15.,
+            explorer_left: false,
             keys: ACTIONS
                 .iter()
                 .map(|(name, key, _)| (*name, vec![key.to_string()]))
@@ -180,15 +183,17 @@ pub struct FloatingCommand {
 
 // The file format. Everything optional.
 #[derive(Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct File {
     font: FontFile,
+    explorer: ExplorerFile,
     colors: ColorsFile,
     keybindings: HashMap<String, Keys>,
     floating_commands: Vec<FloatingCommandFile>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FloatingCommandFile {
     key: Option<Keys>,
     command: Option<String>,
@@ -213,14 +218,20 @@ fn checked_keys(keys: Keys, what: &str, warnings: &mut Vec<String>) -> Vec<Strin
 }
 
 #[derive(Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct FontFile {
     family: Option<String>,
     size: Option<f32>,
 }
 
 #[derive(Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
+struct ExplorerFile {
+    side: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
 struct ColorsFile {
     ui: HashMap<String, String>,
     terminal: HashMap<String, String>,
@@ -326,7 +337,12 @@ impl Config {
         let file: File = match toml::from_str(text) {
             Ok(file) => file,
             Err(err) => {
-                config.warnings.push(format!("config not loaded, using defaults: {}", err.message()));
+                let line = err.span().map(|span| format!("line {}: ", text[..span.start].matches('\n').count() + 1));
+                config.warnings.push(format!(
+                    "config not loaded, using defaults: {}{}",
+                    line.unwrap_or_default(),
+                    err.message()
+                ));
                 return config;
             }
         };
@@ -338,6 +354,12 @@ impl Config {
             Some(size) if (6.0..=72.0).contains(&size) => config.font_size = size,
             Some(size) => config.warnings.push(format!("font.size {size} ignored (allowed: 6 to 72)")),
             None => {}
+        }
+
+        match file.explorer.side.as_deref() {
+            Some("left") => config.explorer_left = true,
+            Some("right") | None => {}
+            Some(side) => config.warnings.push(format!("explorer.side \"{side}\" ignored (allowed: left, right)")),
         }
 
         for (section, colors) in [("ui", &file.colors.ui), ("terminal", &file.colors.terminal)] {
@@ -487,6 +509,9 @@ mod tests {
             [font]
             size = 17
 
+            [explorer]
+            side = "left"
+
             [colors.ui]
             accent = "#7aa2f7"
 
@@ -501,6 +526,7 @@ mod tests {
         );
         assert!(config.warnings.is_empty(), "{:?}", config.warnings);
         assert_eq!(config.font_size, 17.);
+        assert!(config.explorer_left);
         assert_eq!(config.ui.accent, 0x7aa2f7);
         assert_eq!(config.ui.text, UiColors::default().text);
         assert_eq!(config.terminal.ansi[9], 0xff0000);
@@ -518,6 +544,9 @@ mod tests {
             [font]
             size = 500
 
+            [explorer]
+            side = "top"
+
             [colors.ui]
             accent = "blue"
             sparkle = "#ffffff"
@@ -527,7 +556,7 @@ mod tests {
             new_tab = ["alt-t", "alt-notakey"]
             "##,
         );
-        assert_eq!(config.warnings.len(), 5, "{:?}", config.warnings);
+        assert_eq!(config.warnings.len(), 6, "{:?}", config.warnings);
         assert_eq!(config.font_size, 15.);
         assert_eq!(config.ui.accent, UiColors::default().accent);
         assert_eq!(config.keys["new_tab"], vec!["alt-t"]);
@@ -538,6 +567,16 @@ mod tests {
         let config = Config::parse("[colors.ui\naccent = ");
         assert_eq!(config.warnings.len(), 1);
         assert_eq!(config.ui, UiColors::default());
+    }
+
+    #[test]
+    fn misspelled_names_fall_back_to_defaults_and_point_at_the_line() {
+        for text in ["[font]\nsize = 17\n\n[explorr]\nside = \"left\"", "[font]\nsize = 17\nfamly = \"x\""] {
+            let config = Config::parse(text);
+            assert_eq!(config.font_size, 15., "{text}");
+            assert_eq!(config.warnings.len(), 1, "{text}");
+            assert!(config.warnings[0].contains("line "), "{:?}", config.warnings);
+        }
     }
 
     #[test]
@@ -582,6 +621,7 @@ mod tests {
         assert_eq!(example.terminal, defaults.terminal);
         assert_eq!(example.font_family, defaults.font_family);
         assert_eq!(example.font_size, defaults.font_size);
+        assert_eq!(example.explorer_left, defaults.explorer_left);
         assert_eq!(example.keys, defaults.keys);
         assert_eq!(example.floating_commands, defaults.floating_commands);
     }

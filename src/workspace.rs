@@ -978,10 +978,12 @@ impl Workspace {
         match self.tab().explorers.get(&id).cloned() {
             Some(explorer) if explorer.read(cx).focus_handle(cx).is_focused(window) => {
                 self.tab_mut().explorers.remove(&id);
+                editor.update(cx, |editor, _| editor.explorer_open = false);
                 editor.read(cx).focus_handle(cx).focus(window);
             }
             Some(explorer) => explorer.read(cx).focus_handle(cx).focus(window),
             None => {
+                editor.update(cx, |editor, _| editor.explorer_open = true);
                 let explorer = self.new_explorer(editor, cx);
                 explorer.read(cx).focus_handle(cx).focus(window);
                 self.tab_mut().explorers.insert(id, explorer);
@@ -1334,6 +1336,7 @@ impl Workspace {
     /// and floating terminal.
     fn render_active_tab(&self, cx: &mut Context<Self>) -> Div {
         let t = ui(cx);
+        let explorer_left = cx.global::<Config>().explorer_left;
         let tab = self.tab();
         div()
             .flex_1()
@@ -1360,8 +1363,8 @@ impl Workspace {
                         (None, _) => self.render_empty_tab(cx),
                         (Some(root), maximized) => {
                             match maximized.and_then(|id| root.find_leaf(id.as_u64())) {
-                                Some(leaf) => self.render_node(tab, &Node::Leaf(leaf.clone()), t),
-                                None => self.render_node(tab, root, t),
+                                Some(leaf) => self.render_node(tab, &Node::Leaf(leaf.clone()), t, explorer_left),
+                                None => self.render_node(tab, root, t, explorer_left),
                             }
                         }
                     })
@@ -1381,7 +1384,7 @@ impl Workspace {
                                 .shadow_lg()
                                 // Clicks must not fall through to the tiles underneath.
                                 .occlude()
-                                .child(self.render_node(tab, &Node::Leaf(floating.terminal.clone()), t)),
+                                .child(self.render_node(tab, &Node::Leaf(floating.terminal.clone()), t, explorer_left)),
                         )
                     })
                     .when_some(self.manage.as_ref(), |el, manage| el.child(manage_pill(manage.mode, t))),
@@ -1454,10 +1457,14 @@ impl Workspace {
             )
     }
 
-    fn render_node(&self, tab: &Tab, node: &Node<Entity<TerminalView>>, t: UiColors) -> Div {
+    fn render_node(&self, tab: &Tab, node: &Node<Entity<TerminalView>>, t: UiColors, explorer_left: bool) -> Div {
         match node {
             Node::Leaf(terminal) => {
-                let mut el = div().relative().flex().flex_1().min_w_0().min_h_0().gap(px(PANE_GAP)).child(terminal.clone());
+                // No gap: the explorer is joined to its editor's edge.
+                let mut el = div().relative().flex().flex_1().min_w_0().min_h_0().child(terminal.clone());
+                if explorer_left {
+                    el = el.flex_row_reverse();
+                }
                 if let Some(explorer) = tab.explorers.get(&terminal.entity_id()) {
                     el = el.child(explorer.clone());
                 }
@@ -1486,8 +1493,8 @@ impl Workspace {
                     Axis::Col => el.flex_col(),
                 };
                 // Children split the space by the ratio (flex basis 0, grow by share).
-                el.child(grow(self.render_node(tab, first, t), *ratio))
-                    .child(grow(self.render_node(tab, second, t), 1. - *ratio))
+                el.child(grow(self.render_node(tab, first, t, explorer_left), *ratio))
+                    .child(grow(self.render_node(tab, second, t, explorer_left), 1. - *ratio))
             }
         }
     }

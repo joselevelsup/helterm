@@ -7,6 +7,9 @@
 family = "JetBrainsMono Nerd Font"
 size = 15
 
+[explorer]
+side = "right" # or "left": which side of its editor the file explorer opens on
+
 # App chrome: sidebar, tabs, explorer, dialogs. Colors are "#rrggbb".
 [colors.ui]
 background = "#1e1e2e"

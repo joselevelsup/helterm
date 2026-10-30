@@ -146,6 +146,8 @@ impl EventListener for PtyListener {
 
 pub struct TerminalView {
     pub kind: TerminalKind,
+    /// A file explorer is attached: square off that side to join it.
+    pub explorer_open: bool,
     focus_handle: FocusHandle,
     term: Term<PtyListener>,
     writer: PtyWriter,
@@ -511,6 +513,7 @@ impl TerminalView {
 
         Self {
             kind,
+            explorer_open: false,
             focus_handle: cx.focus_handle(),
             term,
             writer,
@@ -934,6 +937,9 @@ struct TerminalPrepaint {
     backgrounds: Vec<(usize, usize, usize, Hsla)>,
     cursor: Option<(usize, usize, CursorShape)>,
     cell_width: Pixels,
+    /// Grid size the backgrounds were built for.
+    columns: usize,
+    screen_lines: usize,
 }
 
 /// A stretch of a row shaped in one go: its first column, its text and the
@@ -1097,6 +1103,8 @@ impl Element for TerminalElement {
             backgrounds,
             cursor,
             cell_width,
+            columns,
+            screen_lines,
         }
     }
 
@@ -1128,7 +1136,15 @@ impl Element for TerminalElement {
         // All backgrounds first, then all text on top.
         let at = |row: usize, col: usize| bounds.origin + point(cell_width * col as f32, line_height * row as f32);
         for &(row, col, cols, color) in &prepaint.backgrounds {
-            let rect = Bounds::new(at(row, col), size(cell_width * cols as f32, line_height));
+            let mut rect = Bounds::new(at(row, col), size(cell_width * cols as f32, line_height));
+            // Backgrounds on the last column / row fill the leftover sliver (less
+            // than a cell) so a full-screen app's theme reaches the pane edge.
+            if col + cols == prepaint.columns {
+                rect.size.width = bounds.right() - rect.origin.x;
+            }
+            if row + 1 == prepaint.screen_lines {
+                rect.size.height = bounds.bottom() - rect.origin.y;
+            }
             window.paint_quad(gpui::fill(rect, color));
         }
         for (row, col, line) in &prepaint.texts {
@@ -1230,9 +1246,14 @@ impl Render for TerminalView {
             .bg(rgb(background))
             .border_1()
             .border_color(rgb(border))
-            .rounded_md()
+            .map(|el| match (self.explorer_open, cx.global::<Config>().explorer_left) {
+                (false, _) => el.rounded_md(),
+                (true, false) => el.border_r_0().rounded_l_md(),
+                (true, true) => el.border_l_0().rounded_r_md(),
+            })
             // Inner padding between the border and the text; the grid shrinks to fit.
-            .p(px(6.))
+            // Helix draws its own edge-to-edge UI, so the padding would just frame it.
+            .when(self.kind != TerminalKind::Editor, |el| el.p(px(6.)))
             .relative()
             .child(TerminalElement { view: cx.entity() })
             .when_some(badge, |el, badge| {

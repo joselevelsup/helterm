@@ -89,12 +89,18 @@ that. Restart Helterm to apply changes.
 Every setting is optional: anything you delete goes back to its default.
 Mistakes (unknown names, bad colors, invalid keys, a key bound to two actions)
 are skipped and listed in a banner at the top of the window, so a typo never
-stops the app from starting.
+stops the app from starting. A file that can't be read at all (broken TOML, a
+misspelled section or setting like `[explorr]`, a wrong type) is ignored in
+favour of the defaults, and the banner says which line is wrong.
 
 ```toml
 [font]
 family = "JetBrainsMono Nerd Font"
 size = 15
+
+# Which side of its editor the file explorer opens on: "right" or "left".
+[explorer]
+side = "left"
 
 # App chrome: sidebar, tabs, explorer, dialogs. Colors are "#rrggbb".
 # background, panel, sidebar, element, border, text, muted, accent, error, warning
