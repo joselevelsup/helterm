@@ -1,11 +1,13 @@
 use std::collections::HashSet;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::Arc;
 
 use gpui::{
     Context, Entity, FocusHandle, Focusable, KeyDownEvent, MouseButton, MouseDownEvent, Render,
-    ScrollHandle, Window, div, prelude::*, px, rgb,
+    ScrollHandle, Task, Window, div, prelude::*, px, rgb,
 };
 
 use crate::config::{Config, UiColors, ui};
@@ -16,7 +18,12 @@ enum Op {
     Create { dir: PathBuf, folder: bool },
     Rename { path: PathBuf },
     Delete { path: PathBuf },
+    /// Fuzzy file search; the results replace the tree while it's open.
+    Search,
 }
+
+/// Search results shown at most, so a broad query doesn't build thousands of rows.
+const MAX_RESULTS: usize = 200;
 
 struct Prompt {
     op: Op,
@@ -109,7 +116,50 @@ fn apply(op: &Op, input: &str) -> io::Result<Option<PathBuf>> {
             }
             Ok(None)
         }
+        // Searching runs as you type; Enter opens a result instead.
+        Op::Search => Ok(None),
     }
+}
+
+/// Every file under `root` (relative paths, one per line) with the tree's skip
+/// rules. Symlinked folders aren't entered, so link loops can't recurse forever.
+fn list_files(root: &Path, show_hidden: bool) -> String {
+    let mut out = String::new();
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let mut rows = vec![];
+        collect(&dir, 0, &HashSet::new(), show_hidden, &mut rows);
+        for row in rows {
+            if !row.is_dir {
+                out.push_str(&row.path.strip_prefix(root).unwrap_or(&row.path).to_string_lossy());
+                out.push('\n');
+            } else if !row.path.is_symlink() {
+                dirs.push(row.path);
+            }
+        }
+    }
+    out
+}
+
+/// Rank `files` against `query` with fzf's matcher (`fzf --filter`), best first.
+fn fzf_filter(query: &str, files: &Arc<str>) -> io::Result<String> {
+    let mut child = Command::new("fzf")
+        .arg(format!("--filter={query}"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let files = files.clone();
+    // Written from a thread: fzf can fill its stdout pipe before reading all input.
+    let writer = std::thread::spawn(move || stdin.write_all(files.as_bytes()));
+    let out = child.wait_with_output()?;
+    let _ = writer.join();
+    // Exit code 1 only means nothing matched.
+    if out.status.code().is_none_or(|code| code > 1) {
+        return Err(io::Error::other("fzf failed"));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 struct Row {
@@ -133,6 +183,10 @@ pub struct FileExplorer {
     prompt: Option<Prompt>,
     /// Show dotfiles (toggled with `.`).
     show_hidden: bool,
+    /// File list of the open search, listed once on its first query.
+    files: Option<Arc<str>>,
+    /// Running search; replacing it cancels the previous one.
+    search_task: Option<Task<()>>,
 }
 
 impl FileExplorer {
@@ -147,6 +201,8 @@ impl FileExplorer {
             scroll: ScrollHandle::new(),
             prompt: None,
             show_hidden: false,
+            files: None,
+            search_task: None,
         };
         this.rebuild();
         this
@@ -191,7 +247,60 @@ impl FileExplorer {
             // insert mode, switch to a proper channel when needed
             editor.send_line(&format!(":open {}", row.path.display()));
             editor.focus_handle(cx).focus(window);
+            if self.searching() {
+                self.close_search();
+            }
         }
+    }
+
+    fn searching(&self) -> bool {
+        matches!(self.prompt, Some(Prompt { op: Op::Search, .. }))
+    }
+
+    /// Back to the tree.
+    fn close_search(&mut self) {
+        self.prompt = None;
+        self.search_task = None;
+        self.rebuild();
+    }
+
+    /// Re-run the search for the current input in the background.
+    fn search(&mut self, cx: &mut Context<Self>) {
+        let Some(prompt) = &self.prompt else { return };
+        let query = prompt.input.clone();
+        let (root, show_hidden, files) = (self.root.clone(), self.show_hidden, self.files.clone());
+        self.search_task = Some(cx.spawn(async move |this, cx| {
+            let (files, result) = cx
+                .background_executor()
+                .spawn(async move {
+                    let files = files.unwrap_or_else(|| list_files(&root, show_hidden).into());
+                    let result = fzf_filter(&query, &files);
+                    (files, result)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.files = Some(files);
+                let Some(prompt) = this.prompt.as_mut().filter(|p| matches!(p.op, Op::Search)) else {
+                    return;
+                };
+                match result {
+                    Ok(out) => {
+                        prompt.error = None;
+                        this.rows = out
+                            .lines()
+                            .take(MAX_RESULTS)
+                            .map(|rel| Row { path: this.root.join(rel), name: rel.to_owned(), is_dir: false, depth: 0 })
+                            .collect();
+                        this.select(0);
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                        prompt.error = Some("fzf not found: install it to search".into())
+                    }
+                    Err(err) => prompt.error = Some(err.to_string()),
+                }
+                cx.notify();
+            });
+        }));
     }
 
     fn start(&mut self, op: Op, input: String) {
@@ -236,8 +345,20 @@ impl FileExplorer {
         }
     }
 
-    fn on_prompt_key(&mut self, event: &KeyDownEvent) {
+    fn on_prompt_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &event.keystroke;
+        if self.searching() {
+            let ctrl = ks.modifiers.control;
+            match ks.key.as_str() {
+                "escape" => return self.close_search(),
+                "enter" => return self.activate(self.selected, window, cx),
+                "down" => return self.select(self.selected + 1),
+                "n" if ctrl => return self.select(self.selected + 1),
+                "up" => return self.select(self.selected.saturating_sub(1)),
+                "p" if ctrl => return self.select(self.selected.saturating_sub(1)),
+                _ => {}
+            }
+        }
         let Some(prompt) = self.prompt.as_mut() else {
             return;
         };
@@ -249,6 +370,7 @@ impl FileExplorer {
             }
             return;
         }
+        let before = prompt.input.clone();
         match ks.key.as_str() {
             "escape" => self.prompt = None,
             "enter" => self.confirm(),
@@ -266,11 +388,14 @@ impl FileExplorer {
             }
             _ => {}
         }
+        if self.searching() && self.prompt.as_ref().is_some_and(|p| p.input != before) {
+            self.search(cx);
+        }
     }
 
     fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.prompt.is_some() {
-            self.on_prompt_key(event);
+            self.on_prompt_key(event, window, cx);
             cx.stop_propagation();
             cx.notify();
             return;
@@ -301,6 +426,11 @@ impl FileExplorer {
                 if let Some(ix) = selected.and_then(|path| self.rows.iter().position(|r| r.path == path)) {
                     self.select(ix);
                 }
+            }
+            "/" | "slash" => {
+                self.start(Op::Search, String::new());
+                self.files = None; // list afresh: files may have changed since the last search
+                self.search(cx);
             }
             "j" | "down" => self.select(ix + 1),
             "k" | "up" => self.select(ix.saturating_sub(1)),
@@ -477,7 +607,7 @@ impl FileExplorer {
                 .text_color(rgb(t.muted))
                 .child("a new file    A new folder")
                 .child("r rename      d delete")
-                .child(". hidden files");
+                .child(". hidden files  / search");
         };
         let name = |path: &Path| path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let label = match &prompt.op {
@@ -485,6 +615,7 @@ impl FileExplorer {
             Op::Create { dir, folder: true } => format!("New folder in {}", self.relative(dir)),
             Op::Rename { path } => format!("Rename {}", name(path)),
             Op::Delete { path } => format!("Delete {} permanently? y/n", name(path)),
+            Op::Search => "Search files (fzf)  ↑↓ Enter Esc".into(),
         };
         footer
             .child(div().text_color(rgb(t.accent)).child(label))
@@ -603,6 +734,29 @@ mod tests {
         assert!(!dir.join("tree").exists());
         assert!(!dir.join("link").exists());
         assert!(target.join("precious").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn search_lists_files_and_ranks_them_with_fzf() {
+        let dir = temp_dir("search");
+        create(&dir, "src/explorer.rs", false).unwrap();
+        create(&dir, "src/main.rs", false).unwrap();
+        create(&dir, ".git/config", false).unwrap();
+        create(&dir, "node_modules/x.js", false).unwrap();
+        std::os::unix::fs::symlink(&dir, dir.join("src/loop")).unwrap();
+
+        let files = list_files(&dir, false);
+        let mut sorted: Vec<&str> = files.lines().collect();
+        sorted.sort();
+        assert_eq!(sorted, ["src/explorer.rs", "src/main.rs"]);
+        assert!(list_files(&dir, true).contains(".git/config"));
+
+        if Command::new("fzf").arg("--version").output().is_ok() {
+            let files: Arc<str> = files.into();
+            assert_eq!(fzf_filter("expl", &files).unwrap(), "src/explorer.rs\n");
+            assert_eq!(fzf_filter("zzz", &files).unwrap(), "");
+        }
         fs::remove_dir_all(dir).unwrap();
     }
 }

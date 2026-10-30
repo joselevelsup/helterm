@@ -269,6 +269,7 @@ These keys are fixed for now.
 | `r` | Rename |
 | `d` | Delete (asks `y/n`; permanent, no trash) |
 | `.` | Show / hide hidden files |
+| `/` | Search files by name with [fzf](https://github.com/junegunn/fzf) (needs `fzf` installed): results replace the tree as you type; `↑` / `↓` (or `Ctrl+P` / `Ctrl+N`) to move, `Enter` to open, `Esc` back to the tree |
 | `Esc` | Back to the editor |
 
 In a name prompt, `←` / `→` / `Home` / `End` move the cursor, `Backspace` /
