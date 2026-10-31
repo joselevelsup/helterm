@@ -10,41 +10,47 @@ size = 15
 [explorer]
 side = "right" # or "left": which side of its editor the file explorer opens on
 
-# App chrome: tabs, explorer, dialogs. Colors are "#rrggbb".
+[colors]
+# Take the colors of the theme set in Helix's config.toml, following its
+# light / dark themes with the desktop. Colors you set below still win.
+use_helix_theme = false
+
+# Colors are "#rrggbb". These are the defaults: uncomment to change one.
+# App chrome: tabs, explorer, dialogs.
 [colors.ui]
-background = "#1e1e2e"
-panel = "#181825"   # tab bar, explorer
-sidebar = "#11111b" # input boxes
-element = "#313244" # hover, selection, quiet borders
-border = "#45475a"
-text = "#cdd6f4"
-muted = "#7f849c"
-accent = "#89b4fa"  # focus borders, headings
-error = "#f38ba8"
-warning = "#f9e2af"
+# background = "#1e1e2e"
+# panel = "#181825"   # tab bar, explorer
+# sidebar = "#11111b" # input boxes
+# element = "#313244" # hover, selection, quiet borders
+# border = "#45475a"
+# text = "#cdd6f4"
+# muted = "#7f849c"
+# accent = "#89b4fa"  # focus borders, headings
+# error = "#f38ba8"
+# warning = "#f9e2af"
 
 # What programs in the terminal see. (Helix draws with its own theme.)
 [colors.terminal]
-foreground = "#cdd6f4"
-background = "#1e1e2e"
-cursor = "#89b4fa"
-selection = "#45475a" # background of selected text
-black = "#45475a"
-red = "#f38ba8"
-green = "#a6e3a1"
-yellow = "#f9e2af"
-blue = "#89b4fa"
-magenta = "#f5c2e7"
-cyan = "#94e2d5"
-white = "#bac2de"
-bright_black = "#585b70"
-bright_red = "#f38ba8"
-bright_green = "#a6e3a1"
-bright_yellow = "#f9e2af"
-bright_blue = "#89b4fa"
-bright_magenta = "#f5c2e7"
-bright_cyan = "#94e2d5"
-bright_white = "#a6adc8"
+# foreground = "#cdd6f4"
+# background = "#1e1e2e"
+# cursor = "#89b4fa"
+# selection = "#45475a" # background of selected text
+# black = "#45475a"
+# red = "#f38ba8"
+# green = "#a6e3a1"
+# yellow = "#f9e2af"
+# blue = "#89b4fa"
+# magenta = "#f5c2e7"
+# cyan = "#94e2d5"
+# white = "#bac2de"
+# bright_black = "#585b70"
+# bright_red = "#f38ba8"
+# bright_green = "#a6e3a1"
+# bright_yellow = "#f9e2af"
+# bright_blue = "#89b4fa"
+# bright_magenta = "#f5c2e7"
+# bright_cyan = "#94e2d5"
+# bright_white = "#a6adc8"
 
 # action = "key", a list of keys, or "" to unbind. Modifiers: ctrl, alt,
 # shift, super. Chords are space separated: "ctrl-k ctrl-t".

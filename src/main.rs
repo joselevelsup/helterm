@@ -1,10 +1,11 @@
 mod config;
 mod container;
 mod explorer;
+mod helix_theme;
 mod terminal;
 mod workspace;
 
-use gpui::{App, AppContext, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
+use gpui::{App, AppContext, Application, Bounds, TitlebarOptions, WindowAppearance, WindowBounds, WindowOptions, px, size};
 
 use crate::config::Config;
 use crate::workspace::Workspace;
@@ -15,7 +16,11 @@ const APP_ID: &str = "io.github.joselevelsup.Helterm";
 
 fn main() {
     Application::new().run(|cx: &mut App| {
-        let config = Config::load();
+        let mut config = Config::load();
+        config.dark = matches!(cx.window_appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark);
+        if config.use_helix_theme {
+            config.apply_helix_theme(helix_theme::load(config.dark));
+        }
         for warning in &config.warnings {
             eprintln!("helterm config: {warning}");
         }

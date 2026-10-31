@@ -152,6 +152,17 @@ pub struct Config {
     pub floating_commands: Vec<FloatingCommand>,
     /// Problems found while loading, shown to the user.
     pub warnings: Vec<String>,
+    /// Take colors from the Helix theme (`[colors] use_helix_theme`).
+    pub use_helix_theme: bool,
+    /// The desktop is in dark mode: picks Helix's dark or light theme, and is
+    /// what Helterm tells programs asking (mode 2031).
+    pub dark: bool,
+    /// Your `[colors]` entries, applied over the Helix theme.
+    user_colors: Vec<(&'static str, String, u32)>,
+    /// Problems loading the Helix theme; replaced on every reload.
+    pub theme_warnings: Vec<String>,
+    /// Files the Helix theme came from, watched for edits.
+    pub theme_files: Vec<PathBuf>,
 }
 
 impl Global for Config {}
@@ -170,6 +181,11 @@ impl Default for Config {
                 .collect(),
             floating_commands: vec![],
             warnings: vec![],
+            use_helix_theme: false,
+            dark: true,
+            user_colors: vec![],
+            theme_warnings: vec![],
+            theme_files: vec![],
         }
     }
 }
@@ -233,6 +249,7 @@ struct ExplorerFile {
 #[derive(Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 struct ColorsFile {
+    use_helix_theme: bool,
     ui: HashMap<String, String>,
     terminal: HashMap<String, String>,
 }
@@ -293,11 +310,14 @@ pub fn state_path() -> Option<PathBuf> {
 /// spec an empty or relative variable is ignored, so files never land relative
 /// to wherever the app was launched from.
 fn xdg_file(xdg: Option<std::ffi::OsString>, home: Option<PathBuf>, fallback: &str, file: &str) -> Option<PathBuf> {
-    let base = xdg
-        .map(PathBuf::from)
+    Some(xdg_base(xdg, home, fallback)?.join("helterm").join(file))
+}
+
+/// `$XDG_*`, else `~/<fallback>`.
+pub fn xdg_base(xdg: Option<std::ffi::OsString>, home: Option<PathBuf>, fallback: &str) -> Option<PathBuf> {
+    xdg.map(PathBuf::from)
         .filter(|dir| dir.is_absolute())
-        .or_else(|| home.map(|home| home.join(fallback)))?;
-    Some(base.join("helterm").join(file))
+        .or_else(|| home.map(|home| home.join(fallback)))
 }
 
 /// Create the config file with defaults; never overwrites an existing one.
@@ -362,6 +382,7 @@ impl Config {
             Some(side) => config.warnings.push(format!("explorer.side \"{side}\" ignored (allowed: left, right)")),
         }
 
+        config.use_helix_theme = file.colors.use_helix_theme;
         for (section, colors) in [("ui", &file.colors.ui), ("terminal", &file.colors.terminal)] {
             for (name, value) in colors {
                 let slot = match section {
@@ -373,7 +394,10 @@ impl Config {
                     (Some(_), None) => config
                         .warnings
                         .push(format!("colors.{section}.{name} = \"{value}\" is not a #rrggbb color")),
-                    (Some(slot), Some(color)) => *slot = color,
+                    (Some(slot), Some(color)) => {
+                        *slot = color;
+                        config.user_colors.push((section, name.clone(), color));
+                    }
                 }
             }
         }
@@ -445,6 +469,28 @@ impl Config {
             let kept = claim(name.to_owned(), keys, &mut self.warnings);
             self.keys.insert(name, kept);
         }
+    }
+
+    /// Colors from scratch: defaults, then the Helix theme, then your `[colors]`.
+    pub fn themed(&self, theme: &crate::helix_theme::HelixTheme) -> (UiColors, TermColors) {
+        let (mut ui, mut terminal) = (UiColors::default(), TermColors::default());
+        let user = self.user_colors.iter().map(|(section, name, color)| (*section, name.as_str(), *color));
+        for (section, name, color) in theme.colors.iter().copied().chain(user) {
+            let slot = match section {
+                "ui" => ui.slot(name),
+                _ => terminal.slot(name),
+            };
+            if let Some(slot) = slot {
+                *slot = color;
+            }
+        }
+        (ui, terminal)
+    }
+
+    pub fn apply_helix_theme(&mut self, theme: crate::helix_theme::HelixTheme) {
+        (self.ui, self.terminal) = self.themed(&theme);
+        self.theme_warnings = theme.warnings;
+        self.theme_files = theme.files;
     }
 
     pub fn bindings(&self) -> Vec<KeyBinding> {
@@ -694,6 +740,24 @@ mod tests {
         assert_eq!(config.floating_commands[0].keys, vec!["alt-t"]);
         assert!(config.keys["new_tab"].is_empty());
         assert_eq!(config.bindings().len(), ACTIONS.len()); // new_tab's lost, lazygit's added
+    }
+
+    #[test]
+    fn your_colors_beat_the_helix_theme() {
+        let mut config = Config::parse("[colors]\nuse_helix_theme = true\n[colors.ui]\naccent = \"#000001\"");
+        assert!(config.warnings.is_empty(), "{:?}", config.warnings);
+        assert!(config.use_helix_theme);
+        config.apply_helix_theme(crate::helix_theme::HelixTheme {
+            colors: vec![("ui", "accent", 0x000002), ("ui", "text", 0x000003), ("terminal", "red", 0x000004)],
+            ..Default::default()
+        });
+        assert_eq!(config.ui.accent, 0x000001);
+        assert_eq!(config.ui.text, 0x000003);
+        assert_eq!(config.terminal.ansi[1], 0x000004);
+        // Switching to a theme without those colors goes back to the defaults.
+        config.apply_helix_theme(Default::default());
+        assert_eq!(config.ui.text, UiColors::default().text);
+        assert_eq!(config.ui.accent, 0x000001);
     }
 
     #[test]

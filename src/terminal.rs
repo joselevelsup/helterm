@@ -123,7 +123,41 @@ type PtyWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 #[derive(Clone)]
 struct PtyListener {
     writer: PtyWriter,
-    colors: TermColors,
+    /// Shared with the view, which keeps it current when the theme changes.
+    colors: Arc<Mutex<TermColors>>,
+}
+
+/// Mode 2031 sequences (light / dark mode), which alacritty ignores: Helix asks
+/// with `CSI ? 996 n` and turns on change reports with `CSI ? 2031 h`.
+#[derive(Debug, PartialEq)]
+enum ThemeSeq {
+    Query,
+    Subscribe,
+    Unsubscribe,
+}
+
+/// The last 8 bytes from the program, so sequences split across reads are seen.
+#[derive(Default)]
+struct ThemeSeqWatch(u64);
+
+impl ThemeSeqWatch {
+    fn push(&mut self, b: u8) -> Option<ThemeSeq> {
+        self.0 = self.0 << 8 | b as u64;
+        let ends_with = |seq: &[u8]| {
+            let value = seq.iter().fold(0u64, |v, b| v << 8 | *b as u64);
+            self.0 & (u64::MAX >> (64 - 8 * seq.len())) == value
+        };
+        match b {
+            b'n' if ends_with(b"\x1b[?996n") => Some(ThemeSeq::Query),
+            b'h' if ends_with(b"\x1b[?2031h") => Some(ThemeSeq::Subscribe),
+            b'l' if ends_with(b"\x1b[?2031l") => Some(ThemeSeq::Unsubscribe),
+            _ => None,
+        }
+    }
+}
+
+fn theme_report(dark: bool) -> &'static [u8] {
+    if dark { b"\x1b[?997;1n" } else { b"\x1b[?997;2n" }
 }
 
 impl EventListener for PtyListener {
@@ -131,7 +165,7 @@ impl EventListener for PtyListener {
         let reply = match event {
             TermEvent::PtyWrite(text) => text,
             TermEvent::ColorRequest(index, format) => {
-                let c = index_rgb(index, &self.colors);
+                let c = index_rgb(index, &self.colors.lock().unwrap());
                 format(Rgb {
                     r: (c >> 16) as u8,
                     g: (c >> 8) as u8,
@@ -167,6 +201,11 @@ pub struct TerminalView {
     copy_mode: CopyModeState,
     /// Points added to the configured font size (Alt++ / Alt+-), per pane.
     zoom: f32,
+    colors: Arc<Mutex<TermColors>>,
+    theme_seqs: ThemeSeqWatch,
+    /// The program asked to hear about light / dark changes (mode 2031).
+    theme_reports: bool,
+    dark: bool,
 }
 
 impl EventEmitter<Exited> for TerminalView {}
@@ -429,14 +468,28 @@ impl TerminalView {
 
         let writer: PtyWriter = Arc::new(Mutex::new(pty.master.take_writer().expect("pty writer")));
         let mut reader = pty.master.try_clone_reader().expect("pty reader");
+        let colors = Arc::new(Mutex::new(cx.global::<Config>().terminal));
         let term = Term::new(
             TermConfig::default(),
             &Dims { cols: 80, rows: 24 },
             PtyListener {
                 writer: writer.clone(),
-                colors: cx.global::<Config>().terminal,
+                colors: colors.clone(),
             },
         );
+        // The Helix theme or the desktop's light / dark mode changed.
+        cx.observe_global::<Config>(|this, cx| {
+            let config = cx.global::<Config>();
+            *this.colors.lock().unwrap() = config.terminal;
+            if this.dark != config.dark {
+                this.dark = config.dark;
+                if this.theme_reports {
+                    this.report_theme();
+                }
+            }
+            cx.notify();
+        })
+        .detach();
 
         // Bounded: when we fall behind, the reader waits and the PTY slows the
         // program down, like other terminals. Unbounded, a flood (`yes`, cat of a
@@ -529,13 +582,28 @@ impl TerminalView {
             scroll_remainder: 0.,
             copy_mode: CopyModeState::default(),
             zoom: 0.,
+            colors,
+            theme_seqs: ThemeSeqWatch::default(),
+            theme_reports: false,
+            dark: cx.global::<Config>().dark,
         }
     }
 
     fn feed(&mut self, bytes: &[u8]) {
         for b in bytes {
             self.parser.advance(&mut self.term, *b);
+            // Answered in stream order: Helix expects this before its DA1 reply.
+            match self.theme_seqs.push(*b) {
+                Some(ThemeSeq::Query) => self.report_theme(),
+                Some(ThemeSeq::Subscribe) => self.theme_reports = true,
+                Some(ThemeSeq::Unsubscribe) => self.theme_reports = false,
+                None => {}
+            }
         }
+    }
+
+    fn report_theme(&self) {
+        let _ = self.writer.lock().unwrap().write_all(theme_report(self.dark));
     }
 
     fn grid_point(&self, position: gpui::Point<Pixels>) -> (GridPoint, Side) {
@@ -1290,6 +1358,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn spots_light_dark_sequences_even_split_across_reads() {
+        let mut watch = ThemeSeqWatch::default();
+        let mut seen = vec![];
+        for chunk in [&b"hello\x1b[?99"[..], b"6n\x1b[?2031", b"h text n h l \x1b[?2031l", b"\x1b[?996h"] {
+            seen.extend(chunk.iter().filter_map(|b| watch.push(*b)));
+        }
+        assert_eq!(seen, vec![ThemeSeq::Query, ThemeSeq::Subscribe, ThemeSeq::Unsubscribe]);
+        assert_eq!(theme_report(true), b"\x1b[?997;1n");
+        assert_eq!(theme_report(false), b"\x1b[?997;2n");
+    }
+
     fn feed_and_capture(input: &[u8]) -> String {
         let out = Arc::new(Mutex::new(Vec::new()));
         let writer: PtyWriter = Arc::new(Mutex::new(Box::new(SharedBuf(out.clone()))));
@@ -1298,7 +1378,7 @@ mod tests {
             &Dims { cols: 80, rows: 24 },
             PtyListener {
                 writer,
-                colors: TermColors::default(),
+                colors: Arc::new(Mutex::new(TermColors::default())),
             },
         );
         let mut parser: Processor = Processor::new();
@@ -1417,7 +1497,7 @@ mod tests {
             &Dims { cols: 40, rows: 5 },
             PtyListener {
                 writer: Arc::new(Mutex::new(Box::new(std::io::sink()))),
-                colors: TermColors::default(),
+                colors: Arc::new(Mutex::new(TermColors::default())),
             },
         );
         let mut parser: Processor = Processor::new();
@@ -1449,7 +1529,7 @@ mod tests {
             &Dims { cols: 20, rows: 5 },
             PtyListener {
                 writer: Arc::new(Mutex::new(Box::new(std::io::sink()))),
-                colors: TermColors::default(),
+                colors: Arc::new(Mutex::new(TermColors::default())),
             },
         );
         let mut parser: Processor = Processor::new();

@@ -108,6 +108,12 @@ size = 15
 [explorer]
 side = "left"
 
+# Use the colors of the theme set in Helix's config.toml (default false). It
+# follows Helix's [theme] light / dark themes with your desktop's mode, and
+# updates when you change the theme. Colors set below still win over it.
+[colors]
+use_helix_theme = true
+
 # App chrome: tabs, explorer, dialogs. Colors are "#rrggbb".
 # background, panel, sidebar, element, border, text, muted, accent, error, warning
 [colors.ui]
@@ -157,7 +163,7 @@ These are the defaults. The **Config name** column is what to use under
 | Keys | Action | Config name |
 | ---- | ------ | ----------- |
 | `Alt+Shift+N` | New workspace (asks for a folder) | `new_workspace` |
-| `Alt+Shift+Q` | Close the current workspace (asks to confirm) | `close_workspace` |
+| `Alt+Shift+Q` | Close the current workspace, or the one selected in the switcher (asks to confirm) | `close_workspace` |
 | `Alt+Tab` | Next workspace | `next_workspace` |
 | `Alt+Shift+Tab` | Previous workspace | `prev_workspace` |
 | `Alt+W` | Workspace switcher (↑/↓ or j/k, Enter, Esc) | `toggle_workspaces` |
@@ -302,6 +308,7 @@ the same archive in `dist/`.
 | `src/container.rs` | The Sway-style split tree |
 | `src/explorer.rs` | File explorer and its file operations |
 | `src/config.rs` | Config file: defaults, parsing with warnings, rebindable actions |
+| `src/helix_theme.rs` | Reads the Helix theme (`use_helix_theme`) and maps it to Helterm colors |
 | `packaging/` | Launcher, icon, install script (`./install.sh` links to it), release-archive script |
 
 ## License

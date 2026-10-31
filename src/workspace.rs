@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use gpui::{
     App, Context, Div, Entity, EntityId, FocusHandle, Hsla, Focusable, KeyDownEvent, ModifiersChangedEvent,
     MouseButton, MouseDownEvent, PathPromptOptions, Render, SharedString, Stateful, Window, actions, div, hsla,
-    prelude::*, px, relative, rgb,
+    WindowAppearance, prelude::*, px, relative, rgb,
 };
 
 use crate::config::{Config, UiColors, ui};
@@ -139,6 +139,8 @@ struct Manage {
 /// State of the "Close workspace?" confirmation.
 struct ConfirmClose {
     project: usize,
+    /// Asked from the Alt+W switcher, which comes back once answered.
+    from_switcher: bool,
     focus_handle: FocusHandle,
 }
 
@@ -280,7 +282,79 @@ impl Workspace {
             }
         })
         .detach();
+        cx.observe_window_appearance(window, |this, window, cx| {
+            let dark = matches!(window.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark);
+            if dark != cx.global::<Config>().dark {
+                cx.update_global::<Config, _>(|config, _| config.dark = dark);
+                this.reload_theme(cx);
+            }
+        })
+        .detach();
+        if cx.global::<Config>().use_helix_theme {
+            Self::watch_theme_files(cx);
+        }
         this
+    }
+
+    /// Reload the Helix theme when Helix's config or a theme file is saved.
+    /// shortcut: polls mtimes every 2s (a few stat calls, off the UI thread),
+    /// switch to inotify (the notify crate) if instant updates matter.
+    fn watch_theme_files(cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let mut last: Option<(Vec<PathBuf>, Vec<Option<std::time::SystemTime>>)> = None;
+            loop {
+                let Ok(files) = cx.read_global(|config: &Config, _| config.theme_files.clone()) else {
+                    return;
+                };
+                let stamps = cx
+                    .background_executor()
+                    .spawn({
+                        let files = files.clone();
+                        async move {
+                            files.iter().map(|f| std::fs::metadata(f).and_then(|m| m.modified()).ok()).collect::<Vec<_>>()
+                        }
+                    })
+                    .await;
+                // A different file list means a reload just happened: new baseline.
+                let edited = last.as_ref().is_some_and(|(f, s)| *f == files && *s != stamps);
+                if edited && this.update(cx, |this, cx| this.reload_theme(cx)).is_err() {
+                    return;
+                }
+                last = Some((files, stamps));
+                cx.background_executor().timer(std::time::Duration::from_secs(2)).await;
+            }
+        })
+        .detach();
+    }
+
+    /// Read the Helix theme off the UI thread, then apply it if anything changed.
+    fn reload_theme(&mut self, cx: &mut Context<Self>) {
+        let config = cx.global::<Config>();
+        if !config.use_helix_theme {
+            return;
+        }
+        let dark = config.dark;
+        let load = cx.background_executor().spawn(async move { crate::helix_theme::load(dark) });
+        cx.spawn(async move |this, cx| {
+            let theme = load.await;
+            this.update(cx, |this, cx| {
+                let config = cx.global::<Config>();
+                let new_warnings = theme.warnings != config.theme_warnings;
+                let unchanged = !new_warnings
+                    && theme.files == config.theme_files
+                    && config.themed(&theme) == (config.ui, config.terminal);
+                if unchanged {
+                    return;
+                }
+                if new_warnings && !theme.warnings.is_empty() {
+                    this.config_warnings_dismissed = false;
+                }
+                cx.update_global::<Config, _>(|config, _| config.apply_helix_theme(theme));
+                cx.refresh_windows();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Remember the workspace list (folders in switcher order) for the next start.
@@ -498,10 +572,14 @@ impl Workspace {
         if self.projects.is_empty() || self.new_workspace.is_some() || self.confirm_close.is_some() {
             return;
         }
+        self.open_switcher(self.active, window, cx);
+    }
+
+    fn open_switcher(&mut self, selected: usize, window: &mut Window, cx: &mut Context<Self>) {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
         self.switcher = Some(Switcher {
-            selected: self.active,
+            selected,
             peek: false,
             focus_handle,
         });
@@ -555,11 +633,13 @@ impl Workspace {
         if self.projects.is_empty() || self.new_workspace.is_some() || self.confirm_close.is_some() {
             return;
         }
-        self.switcher = None;
+        // From the Alt+W switcher it closes the selected workspace, not the current one.
+        let selected = self.switcher.take().filter(|s| !s.peek).map(|s| s.selected);
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
         self.confirm_close = Some(ConfirmClose {
-            project: self.active,
+            project: selected.unwrap_or(self.active),
+            from_switcher: selected.is_some(),
             focus_handle,
         });
         cx.notify();
@@ -568,12 +648,17 @@ impl Workspace {
     fn confirm_close_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(modal) = self.confirm_close.take() {
             self.close_project(modal.project, window, cx);
+            if modal.from_switcher && !self.projects.is_empty() {
+                self.open_switcher(modal.project.min(self.projects.len() - 1), window, cx);
+            }
         }
     }
 
     fn cancel_close_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.confirm_close = None;
-        self.focus_active_tab(window, cx);
+        match self.confirm_close.take() {
+            Some(modal) if modal.from_switcher => self.open_switcher(modal.project, window, cx),
+            _ => self.focus_active_tab(window, cx),
+        }
         cx.notify();
     }
 
@@ -1121,7 +1206,34 @@ impl Workspace {
                 .when(ix == self.active && !switcher.peek, |el| {
                     el.child(div().flex_none().text_size(px(11.)).text_color(rgb(t.accent)).child("current"))
                 })
+                .when(!switcher.peek, |el| {
+                    el.child(
+                        div()
+                            .id(("close-workspace", ix))
+                            .flex_none()
+                            .px_1()
+                            .rounded_sm()
+                            .text_color(rgb(t.muted))
+                            .hover(|el| el.bg(rgb(t.border)).text_color(rgb(t.error)))
+                            .child("×")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                                    // Don't let the row underneath switch to it as well.
+                                    cx.stop_propagation();
+                                    if let Some(switcher) = this.switcher.as_mut() {
+                                        switcher.selected = ix;
+                                    }
+                                    this.close_workspace(&CloseWorkspace, window, cx);
+                                }),
+                            ),
+                    )
+                })
         });
+        let hint = match cx.global::<Config>().key_label("close_workspace") {
+            Some(key) => format!("↑↓ select  ·  enter open  ·  {key} close  ·  esc"),
+            None => "↑↓ select  ·  enter open  ·  esc".to_owned(),
+        };
         let new_label = match cx.global::<Config>().key_label("new_workspace") {
             Some(key) => format!("+ New workspace  {key}"),
             None => "+ New workspace".to_owned(),
@@ -1152,7 +1264,7 @@ impl Workspace {
                                 .gap_2()
                                 .text_size(px(11.))
                                 .text_color(rgb(t.muted))
-                                .child("↑↓ select  ·  enter open  ·  esc close")
+                                .child(hint)
                                 .child(modal_button("switcher-new", new_label, false, t).whitespace_nowrap().on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|this, _: &MouseDownEvent, window, cx| {
@@ -1342,13 +1454,16 @@ impl Workspace {
     /// Banner listing config problems; nothing when the config loaded cleanly.
     fn render_config_warnings(&self, cx: &mut Context<Self>) -> Option<Div> {
         let t = ui(cx);
-        let config_warnings = &cx.global::<Config>().warnings;
-        if config_warnings.is_empty() && self.state_warnings.is_empty() {
+        let config = cx.global::<Config>();
+        if config.warnings.is_empty() && config.theme_warnings.is_empty() && self.state_warnings.is_empty() {
             return None;
         }
         let path = crate::config::path().map(|p| p.display().to_string()).unwrap_or_default();
-        let config_lines = config_warnings.iter().map(|w| format!("{path}: {w}"));
-        let lines: Vec<String> = config_lines.chain(self.state_warnings.iter().cloned()).collect();
+        let config_lines = config.warnings.iter().map(|w| format!("{path}: {w}"));
+        let lines: Vec<String> = config_lines
+            .chain(config.theme_warnings.iter().cloned())
+            .chain(self.state_warnings.iter().cloned())
+            .collect();
         Some(
             div()
                 .flex_none()
@@ -1676,6 +1791,9 @@ fn modal_overlay(id: &'static str, focus_handle: &FocusHandle) -> Stateful<Div> 
         // Keep clicks and keys away from the terminals underneath.
         .occlude()
         .track_focus(focus_handle)
+        // A click on a button that closes the dialog moves focus elsewhere; without
+        // this, gpui's focus-on-click would then hand it back to the closed dialog.
+        .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
 }
 
 fn modal_panel(title: impl Into<SharedString>, t: UiColors) -> Div {
