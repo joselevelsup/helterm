@@ -20,8 +20,9 @@ project folder with its editors, shells and tools arranged around it. It isn't
 trying to be a plain terminal emulator or a multiplexer; the terminal and the
 panes are just how the project is laid out.
 
-- **Workspaces are projects**: one per folder, listed in a sidebar (shrinkable
-  to Slack-style initials). The list is saved and reopened on the next start.
+- **Workspaces are projects**: one per folder, picked from a switcher
+  (`Alt+W`) that also pops up while you hold the next/previous workspace keys,
+  like Zed's tab switcher. The list is saved and reopened on the next start.
 - **[Helix](https://helix-editor.com) is first-class**: editor containers open
   Helix in the project, with a file explorer you can toggle next to them to
   open, create, rename and delete files from the keyboard.
@@ -107,7 +108,7 @@ size = 15
 [explorer]
 side = "left"
 
-# App chrome: sidebar, tabs, explorer, dialogs. Colors are "#rrggbb".
+# App chrome: tabs, explorer, dialogs. Colors are "#rrggbb".
 # background, panel, sidebar, element, border, text, muted, accent, error, warning
 [colors.ui]
 accent = "#7aa2f7"
@@ -159,7 +160,7 @@ These are the defaults. The **Config name** column is what to use under
 | `Alt+Shift+Q` | Close the current workspace (asks to confirm) | `close_workspace` |
 | `Alt+Tab` | Next workspace | `next_workspace` |
 | `Alt+Shift+Tab` | Previous workspace | `prev_workspace` |
-| `Alt+B` | Shrink / enlarge the workspace bar | `toggle_sidebar` |
+| `Alt+W` | Workspace switcher (↑/↓ or j/k, Enter, Esc) | `toggle_workspaces` |
 
 > COSMIC, GNOME and KDE use `Alt+Tab` / `Alt+Shift+Tab` to switch windows, so
 > Helterm never sees them there. Free them in your desktop's keyboard

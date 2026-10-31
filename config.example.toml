@@ -10,11 +10,11 @@ size = 15
 [explorer]
 side = "right" # or "left": which side of its editor the file explorer opens on
 
-# App chrome: sidebar, tabs, explorer, dialogs. Colors are "#rrggbb".
+# App chrome: tabs, explorer, dialogs. Colors are "#rrggbb".
 [colors.ui]
 background = "#1e1e2e"
 panel = "#181825"   # tab bar, explorer
-sidebar = "#11111b" # workspace bar, input boxes
+sidebar = "#11111b" # input boxes
 element = "#313244" # hover, selection, quiet borders
 border = "#45475a"
 text = "#cdd6f4"
@@ -59,6 +59,7 @@ close_workspace = "alt-shift-q"
 new_workspace = "alt-shift-n"
 next_workspace = "alt-tab"        # COSMIC/GNOME/KDE use Alt+Tab to switch windows;
 prev_workspace = "alt-shift-tab"  # free it there or pick another key here
+toggle_workspaces = "alt-w"       # workspace switcher
 focus_left = "alt-h"
 focus_down = "alt-j"
 focus_up = "alt-k"
@@ -67,7 +68,6 @@ toggle_explorer = "alt-e"
 new_tab = "alt-t"
 next_tab = "alt-]"
 prev_tab = "alt-["
-toggle_sidebar = "alt-b"
 toggle_maximize = "alt-z"
 manage_mode = "alt-m"      # select a container, then r: resize, m: move
 toggle_floating = "alt-f"

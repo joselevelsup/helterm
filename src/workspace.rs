@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use gpui::{
-    App, Context, Div, Entity, EntityId, FocusHandle, Hsla, Focusable, KeyDownEvent, MouseButton,
-    MouseDownEvent, PathPromptOptions, Render, SharedString, Stateful, Window, actions, div, hsla,
+    App, Context, Div, Entity, EntityId, FocusHandle, Hsla, Focusable, KeyDownEvent, ModifiersChangedEvent,
+    MouseButton, MouseDownEvent, PathPromptOptions, Render, SharedString, Stateful, Window, actions, div, hsla,
     prelude::*, px, relative, rgb,
 };
 
@@ -27,7 +27,7 @@ actions!(
         NewTab,
         NextTab,
         PrevTab,
-        ToggleSidebar,
+        ToggleWorkspaces,
         ToggleMaximize,
         ToggleManage,
         ToggleFloating,
@@ -118,15 +118,6 @@ impl Project {
             self.base.clone()
         }
     }
-
-    /// Slack-style badge for the collapsed sidebar: initial (+ number if duplicated).
-    fn badge(&self) -> String {
-        let mut badge: String = self.base.chars().next().into_iter().flat_map(char::to_uppercase).collect();
-        if self.dup > 1 {
-            badge.push_str(&self.dup.to_string());
-        }
-        badge
-    }
 }
 
 /// Management mode (Alt+M): pick a container, then resize or move it.
@@ -151,6 +142,16 @@ struct ConfirmClose {
     focus_handle: FocusHandle,
 }
 
+/// The workspace switcher: opened with Alt+W, or shown while holding the
+/// next/prev workspace key.
+struct Switcher {
+    selected: usize,
+    /// Shown by next/prev workspace: the switch already happened, and it closes
+    /// once the held modifiers are released. Keeps focus on the terminal.
+    peek: bool,
+    focus_handle: FocusHandle,
+}
+
 /// State of the "New workspace" modal.
 struct NewWorkspaceModal {
     folder: Option<PathBuf>,
@@ -161,8 +162,7 @@ struct NewWorkspaceModal {
 pub struct Workspace {
     projects: Vec<Project>,
     active: usize,
-    /// Slack-style narrow sidebar showing only workspace initials.
-    sidebar_collapsed: bool,
+    switcher: Option<Switcher>,
     new_workspace: Option<NewWorkspaceModal>,
     confirm_close: Option<ConfirmClose>,
     manage: Option<Manage>,
@@ -208,7 +208,7 @@ struct SavedWorkspace {
     path: PathBuf,
 }
 
-/// Saved workspace folders in sidebar order; a missing file means none.
+/// Saved workspace folders in switcher order; a missing file means none.
 fn load_saved(path: &std::path::Path) -> Result<Vec<PathBuf>, String> {
     match std::fs::read_to_string(path) {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(vec![]),
@@ -243,7 +243,7 @@ impl Workspace {
         let mut this = Self {
             projects: vec![],
             active: 0,
-            sidebar_collapsed: false,
+            switcher: None,
             new_workspace: None,
             confirm_close: None,
             manage: None,
@@ -272,10 +272,18 @@ impl Workspace {
         }
         this.active = 0;
         this.focus_active_tab(window, cx);
+        // Leaving the window while holding the switch key: the release never arrives.
+        cx.observe_window_activation(window, |this, window, cx| {
+            if !window.is_window_active() && this.switcher.as_ref().is_some_and(|s| s.peek) {
+                this.switcher = None;
+                cx.notify();
+            }
+        })
+        .detach();
         this
     }
 
-    /// Remember the workspace list (folders in sidebar order) for the next start.
+    /// Remember the workspace list (folders in switcher order) for the next start.
     fn save(&mut self) {
         let Some(path) = crate::config::state_path() else {
             return;
@@ -452,15 +460,94 @@ impl Workspace {
     }
 
     fn next_workspace(&mut self, _: &NextWorkspace, window: &mut Window, cx: &mut Context<Self>) {
-        if self.projects.len() > 1 {
-            self.activate_project((self.active + 1) % self.projects.len(), window, cx);
-        }
+        self.step_workspace(1, window, cx);
     }
 
     fn prev_workspace(&mut self, _: &PrevWorkspace, window: &mut Window, cx: &mut Context<Self>) {
+        self.step_workspace(self.projects.len().saturating_sub(1), window, cx);
+    }
+
+    /// Next/prev workspace: moves the selection of an open switcher, else switches
+    /// right away and shows the switcher until the held modifiers are released.
+    fn step_workspace(&mut self, step: usize, window: &mut Window, cx: &mut Context<Self>) {
         let len = self.projects.len();
-        if len > 1 {
-            self.activate_project((self.active + len - 1) % len, window, cx);
+        if len == 0 || self.new_workspace.is_some() || self.confirm_close.is_some() {
+            return;
+        }
+        if let Some(switcher) = self.switcher.as_mut().filter(|s| !s.peek) {
+            switcher.selected = (switcher.selected + step) % len;
+            cx.notify();
+            return;
+        }
+        self.activate_project((self.active + step) % len, window, cx);
+        // A key bound without modifiers would have no release to close it.
+        if window.modifiers().modified() {
+            self.switcher = Some(Switcher {
+                selected: self.active,
+                peek: true,
+                focus_handle: cx.focus_handle(),
+            });
+        }
+    }
+
+    fn toggle_workspaces(&mut self, _: &ToggleWorkspaces, window: &mut Window, cx: &mut Context<Self>) {
+        if self.switcher.is_some() {
+            self.close_switcher(window, cx);
+            return;
+        }
+        if self.projects.is_empty() || self.new_workspace.is_some() || self.confirm_close.is_some() {
+            return;
+        }
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        self.switcher = Some(Switcher {
+            selected: self.active,
+            peek: false,
+            focus_handle,
+        });
+        cx.notify();
+    }
+
+    fn close_switcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.switcher.take().is_some_and(|s| !s.peek) {
+            self.focus_active_tab(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn pick_workspace(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.switcher = None;
+        if ix < self.projects.len() {
+            self.activate_project(ix, window, cx);
+        } else {
+            self.focus_active_tab(window, cx);
+        }
+    }
+
+    fn switcher_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(switcher) = self.switcher.as_mut().filter(|s| !s.peek) else {
+            return;
+        };
+        let len = self.projects.len().max(1);
+        let ks = &event.keystroke;
+        match (ks.modifiers.control, ks.key.as_str()) {
+            (false, "up" | "k") | (true, "p") => switcher.selected = (switcher.selected + len - 1) % len,
+            (false, "down" | "j") | (true, "n") => switcher.selected = (switcher.selected + 1) % len,
+            (_, "enter") => {
+                let ix = switcher.selected;
+                self.pick_workspace(ix, window, cx);
+            }
+            (_, "escape") => self.close_switcher(window, cx),
+            _ => return,
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn switcher_modifiers(&mut self, event: &ModifiersChangedEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if !event.modifiers.modified() && self.switcher.as_ref().is_some_and(|s| s.peek) {
+            self.switcher = None;
+            cx.notify();
         }
     }
 
@@ -468,6 +555,7 @@ impl Workspace {
         if self.projects.is_empty() || self.new_workspace.is_some() || self.confirm_close.is_some() {
             return;
         }
+        self.switcher = None;
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
         self.confirm_close = Some(ConfirmClose {
@@ -490,6 +578,7 @@ impl Workspace {
     }
 
     fn open_new_workspace_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.switcher = None;
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
         self.new_workspace = Some(NewWorkspaceModal {
@@ -729,6 +818,7 @@ impl Workspace {
         if self.projects.is_empty() || self.new_workspace.is_some() || self.confirm_close.is_some() {
             return;
         }
+        self.switcher = None;
         let Some(root) = self.tab().root.as_ref() else {
             return; // nothing tiled to manage
         };
@@ -994,118 +1084,84 @@ impl Workspace {
 
     // Rendering ----------------------------------------------------------------
 
-    fn toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
-        self.sidebar_collapsed = !self.sidebar_collapsed;
-        cx.notify();
-    }
-
-    fn render_sidebar(&self, cx: &mut Context<Self>) -> Div {
+    fn render_switcher(&self, switcher: &Switcher, cx: &mut Context<Self>) -> Stateful<Div> {
         let t = ui(cx);
-        let collapsed = self.sidebar_collapsed;
-
-        let toggle = div()
-            .id("toggle-sidebar")
-            .flex_none()
-            .px_1()
-            .rounded_sm()
-            .text_color(rgb(t.muted))
-            .hover(|el| el.bg(rgb(t.element)).text_color(rgb(t.text)))
-            .child(if collapsed { "»" } else { "«" })
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                    this.toggle_sidebar(&ToggleSidebar, window, cx)
-                }),
-            );
-
-        let header = div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .text_size(px(14.))
-            .when(!collapsed, |el| {
-                el.child(div().text_color(rgb(t.accent)).child("WORKSPACES"))
-            })
-            .child(toggle);
-
-        let entries = self.projects.iter().enumerate().map(|(ix, project)| {
-            let active = ix == self.active;
-            let el = div()
+        let rows = self.projects.iter().enumerate().map(|(ix, project)| {
+            let selected = ix == switcher.selected;
+            div()
                 .id(("workspace", ix))
-                .rounded_md()
-                .bg(rgb(if active { t.element } else { t.sidebar }))
-                .text_color(rgb(if active { t.text } else { t.muted }))
+                .flex()
+                .items_center()
+                .gap_3()
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .when(selected, |el| el.bg(rgb(t.element)))
                 .hover(|el| el.bg(rgb(t.element)))
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(move |this, _: &MouseDownEvent, window, cx| {
-                        this.activate_project(ix, window, cx)
-                    }),
-                );
-            if collapsed {
-                el.size(px(32.))
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .justify_center()
-                    .text_size(px(if project.dup > 1 { 12. } else { 16. }))
-                    .child(project.badge())
-            } else {
-                el.text_size(px(13.)).px_2().py_1().child(project.name())
-            }
+                    cx.listener(move |this, _: &MouseDownEvent, window, cx| this.pick_workspace(ix, window, cx)),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(rgb(if selected { t.text } else { t.muted }))
+                        .child(project.name()),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_size(px(11.))
+                        .text_color(rgb(t.muted))
+                        .child(project.root.display().to_string()),
+                )
+                .when(ix == self.active && !switcher.peek, |el| {
+                    el.child(div().flex_none().text_size(px(11.)).text_color(rgb(t.accent)).child("current"))
+                })
         });
-
-        let add = div()
-            .id("new-workspace")
-            .flex()
-            .flex_none()
-            .items_center()
-            .justify_center()
-            .rounded_md()
-            .text_color(rgb(t.muted))
-            .border_1()
-            .border_dashed()
-            .border_color(rgb(t.border))
-            .hover(|el| el.bg(rgb(t.element)).text_color(rgb(t.text)))
-            .map(|el| {
-                if collapsed {
-                    el.size(px(32.)).text_size(px(16.)).child("+")
-                } else {
-                    el.py_1().text_size(px(13.)).whitespace_nowrap().child("+ New workspace")
-                }
-            })
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                    this.open_new_workspace_modal(window, cx)
-                }),
-            );
-
-        div()
-            .flex_none()
-            .w(px(if collapsed { 48. } else { 180. }))
-            .h_full()
-            .bg(rgb(t.sidebar))
-            .border_r_1()
-            .border_color(rgb(t.element))
-            .p(px(if collapsed { 8. } else { 12. }))
-            .flex()
-            .flex_col()
-            .when(collapsed, |el| el.items_center())
-            .gap_2()
-            .child(header)
+        let new_label = match cx.global::<Config>().key_label("new_workspace") {
+            Some(key) => format!("+ New workspace  {key}"),
+            None => "+ New workspace".to_owned(),
+        };
+        modal_overlay("workspace-switcher", &switcher.focus_handle)
+            .items_start()
+            .pt(px(80.))
+            .on_key_down(cx.listener(Self::switcher_key))
             .child(
-                div()
-                    .id("workspace-list")
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_h_0()
-                    .gap_1()
-                    .overflow_y_scroll()
-                    .children(entries),
+                modal_panel("Workspaces", t)
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("workspace-list")
+                            .flex()
+                            .flex_col()
+                            .max_h(px(400.))
+                            .overflow_y_scroll()
+                            .children(rows),
+                    )
+                    .when(!switcher.peek, |el| {
+                        el.child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .items_center()
+                                .justify_between()
+                                .gap_2()
+                                .text_size(px(11.))
+                                .text_color(rgb(t.muted))
+                                .child("↑↓ select  ·  enter open  ·  esc close")
+                                .child(modal_button("switcher-new", new_label, false, t).whitespace_nowrap().on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                                        this.open_new_workspace_modal(window, cx)
+                                    }),
+                                )),
+                        )
+                    }),
             )
-            .child(add)
     }
 
     fn render_new_workspace_modal(&self, modal: &NewWorkspaceModal, cx: &mut Context<Self>) -> Stateful<Div> {
@@ -1525,7 +1581,8 @@ impl Render for Workspace {
             .text_color(rgb(t.text))
             .font_family(cx.global::<Config>().font_family.clone())
             // Workspace-level actions work even with no workspace open.
-            .on_action(cx.listener(Self::toggle_sidebar))
+            .on_action(cx.listener(Self::toggle_workspaces))
+            .on_modifiers_changed(cx.listener(Self::switcher_modifiers))
             .on_action(cx.listener(Self::toggle_manage))
             .on_action(cx.listener(Self::close_workspace))
             .on_action(cx.listener(Self::new_workspace))
@@ -1549,7 +1606,6 @@ impl Render for Workspace {
                     .on_action(cx.listener(Self::run_floating_command))
                     .on_action(cx.listener(Self::float_focused))
             })
-            .child(self.render_sidebar(cx))
             .child(
                 div()
                     .flex_1()
@@ -1562,6 +1618,7 @@ impl Render for Workspace {
                         false => self.render_active_tab(cx),
                     }),
             )
+            .when_some(self.switcher.as_ref(), |el, switcher| el.child(self.render_switcher(switcher, cx)))
             .when_some(self.new_workspace.as_ref(), |el, modal| {
                 el.child(self.render_new_workspace_modal(modal, cx))
             })
