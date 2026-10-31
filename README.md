@@ -4,6 +4,11 @@
 > like to work. You're welcome to use it at your own leisure, but expect rough
 > edges and no promises of support.
 
+## Platform support
+
+Helterm is built and used on **Fedora Linux**. It has **not been tested on
+macOS or Windows**, and releases only ship a Linux (x86_64) build.
+
 ## Why?
 
 Because I wanted to, and therefore I did.
