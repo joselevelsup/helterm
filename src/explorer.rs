@@ -6,7 +6,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use gpui::{
-    Context, Entity, FocusHandle, Focusable, KeyDownEvent, MouseButton, MouseDownEvent, Render,
+    Context, Entity, FocusHandle, Focusable, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, Render,
     ScrollHandle, Task, Window, div, prelude::*, px, rgb,
 };
 
@@ -506,6 +506,13 @@ impl Render for FileExplorer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = ui(cx);
         let focused = self.focus_handle.is_focused(window);
+        // Accent tint: themes keep the accent readable on the background, which
+        // `border` (Helix's window divider) often isn't.
+        let accent: Hsla = rgb(t.accent).into();
+        let selected_bg = match focused {
+            true => Hsla { a: 0.3, ..accent },
+            false => rgb(t.element).into(),
+        };
         let rows = self.rows.iter().enumerate().map(|(ix, row)| {
             let icon = match (row.is_dir, self.expanded.contains(&row.path)) {
                 (true, true) => "▾",
@@ -524,7 +531,7 @@ impl Render for FileExplorer {
                 .pl(px(8. + row.depth as f32 * 12.))
                 .text_color(rgb(if row.is_dir { t.accent } else { t.text }))
                 .when(selected, |el| {
-                    el.bg(rgb(if focused { t.border } else { t.element }))
+                    el.bg(selected_bg)
                 })
                 .hover(|el| el.bg(rgb(t.element)))
                 .child(div().flex_none().w(px(12.)).child(icon))
