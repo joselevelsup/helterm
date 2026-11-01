@@ -1316,12 +1316,11 @@ impl Render for TerminalView {
             .border_color(rgb(border))
             .map(|el| match (self.explorer_open, cx.global::<Config>().explorer_left) {
                 (false, _) => el.rounded_md(),
-                (true, false) => el.border_r_0().rounded_l_md(),
-                (true, true) => el.border_l_0().rounded_r_md(),
+                (true, false) => el.rounded_l_md(),
+                (true, true) => el.rounded_r_md(),
             })
             // Inner padding between the border and the text; the grid shrinks to fit.
-            // Helix draws its own edge-to-edge UI, so the padding would just frame it.
-            .when(self.kind != TerminalKind::Editor, |el| el.p(px(6.)))
+            .p(px(config.padding))
             .relative()
             .child(TerminalElement { view: cx.entity() })
             .when_some(badge, |el, badge| {

@@ -144,6 +144,8 @@ pub struct Config {
     pub terminal: TermColors,
     pub font_family: SharedString,
     pub font_size: f32,
+    /// Space inside each container, between its border and its contents.
+    pub padding: f32,
     /// File explorer on the left of its editor instead of the right.
     pub explorer_left: bool,
     /// Action name -> key strings (validated). Empty means unbound.
@@ -174,6 +176,7 @@ impl Default for Config {
             terminal: TermColors::default(),
             font_family: "JetBrainsMono Nerd Font".into(),
             font_size: 15.,
+            padding: 6.,
             explorer_left: false,
             keys: ACTIONS
                 .iter()
@@ -202,6 +205,7 @@ pub struct FloatingCommand {
 #[serde(default, deny_unknown_fields)]
 struct File {
     font: FontFile,
+    container: ContainerFile,
     explorer: ExplorerFile,
     colors: ColorsFile,
     keybindings: HashMap<String, Keys>,
@@ -238,6 +242,12 @@ fn checked_keys(keys: Keys, what: &str, warnings: &mut Vec<String>) -> Vec<Strin
 struct FontFile {
     family: Option<String>,
     size: Option<f32>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct ContainerFile {
+    padding: Option<f32>,
 }
 
 #[derive(Deserialize, Default)]
@@ -373,6 +383,11 @@ impl Config {
         match file.font.size {
             Some(size) if (6.0..=72.0).contains(&size) => config.font_size = size,
             Some(size) => config.warnings.push(format!("font.size {size} ignored (allowed: 6 to 72)")),
+            None => {}
+        }
+        match file.container.padding {
+            Some(padding) if (0.0..=64.0).contains(&padding) => config.padding = padding,
+            Some(padding) => config.warnings.push(format!("container.padding {padding} ignored (allowed: 0 to 64)")),
             None => {}
         }
 
@@ -555,6 +570,9 @@ mod tests {
             [font]
             size = 17
 
+            [container]
+            padding = 10
+
             [explorer]
             side = "left"
 
@@ -572,6 +590,7 @@ mod tests {
         );
         assert!(config.warnings.is_empty(), "{:?}", config.warnings);
         assert_eq!(config.font_size, 17.);
+        assert_eq!(config.padding, 10.);
         assert!(config.explorer_left);
         assert_eq!(config.ui.accent, 0x7aa2f7);
         assert_eq!(config.ui.text, UiColors::default().text);
@@ -590,6 +609,9 @@ mod tests {
             [font]
             size = 500
 
+            [container]
+            padding = -5
+
             [explorer]
             side = "top"
 
@@ -602,8 +624,9 @@ mod tests {
             new_tab = ["alt-t", "alt-notakey"]
             "##,
         );
-        assert_eq!(config.warnings.len(), 6, "{:?}", config.warnings);
+        assert_eq!(config.warnings.len(), 7, "{:?}", config.warnings);
         assert_eq!(config.font_size, 15.);
+        assert_eq!(config.padding, 6.);
         assert_eq!(config.ui.accent, UiColors::default().accent);
         assert_eq!(config.keys["new_tab"], vec!["alt-t"]);
     }
@@ -667,6 +690,7 @@ mod tests {
         assert_eq!(example.terminal, defaults.terminal);
         assert_eq!(example.font_family, defaults.font_family);
         assert_eq!(example.font_size, defaults.font_size);
+        assert_eq!(example.padding, defaults.padding);
         assert_eq!(example.explorer_left, defaults.explorer_left);
         assert_eq!(example.keys, defaults.keys);
         assert_eq!(example.floating_commands, defaults.floating_commands);

@@ -7,6 +7,9 @@
 family = "JetBrainsMono Nerd Font"
 size = 15
 
+[container]
+padding = 6 # space between a container's border and its contents (0 to 64)
+
 [explorer]
 side = "right" # or "left": which side of its editor the file explorer opens on
 
