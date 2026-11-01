@@ -35,7 +35,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Test
-        run: cargo test --locked
+        run: cargo test
 
       - name: Build archive
         run: packaging/make-release.sh
