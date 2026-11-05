@@ -32,6 +32,8 @@ pub enum TerminalKind {
     Editor,
     /// A command like "lazygit", run through the user's shell.
     Command(String),
+    /// The coding agent from `[agent] command`, run through the user's shell.
+    Agent(String),
 }
 
 /// Bytes per PTY read. Large reads mean few wake-ups of the UI thread during a
@@ -480,9 +482,11 @@ impl TerminalView {
         let mut cmd = match &kind {
             TerminalKind::Editor => through_shell("hx"),
             TerminalKind::Terminal => CommandBuilder::new_default_prog(),
-            TerminalKind::Command(command) => through_shell(command),
+            TerminalKind::Command(command) | TerminalKind::Agent(command) => through_shell(command),
         };
         cmd.env("TERM", "xterm-256color");
+        // Lets agent hooks and scripts know they can signal Helterm.
+        cmd.env("HELTERM", "1");
         cmd.env("COLORTERM", "truecolor");
         cmd.cwd(&cwd);
 

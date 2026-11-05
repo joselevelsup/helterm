@@ -13,6 +13,12 @@ padding = 6 # space between a container's border and its contents (0 to 64)
 [explorer]
 side = "right" # or "left": which side of its editor the file explorer opens on
 
+[agent]
+# The coding agent that agent containers (new_agent, Alt+A) run, through your
+# shell in the workspace folder. Any command with arguments works, e.g.
+# "opencode", "claude", "codex", "pi", "opencode --continue".
+# command = "opencode"
+
 [colors]
 # Take the colors of the theme set in Helix's config.toml, following its
 # light / dark themes with the desktop. Colors you set below still win.
@@ -63,6 +69,7 @@ use_helix_theme = false
 split_right = "alt-enter"
 split_down = "alt-shift-enter"
 new_editor = "alt-o"
+new_agent = "alt-a"   # runs [agent] command
 close_container = "alt-q"
 close_workspace = "alt-shift-q"
 new_workspace = "alt-shift-n"

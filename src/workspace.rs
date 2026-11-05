@@ -18,6 +18,7 @@ actions!(
         SplitRight,
         SplitDown,
         NewEditor,
+        NewAgent,
         CloseContainer,
         FocusLeft,
         FocusRight,
@@ -234,13 +235,17 @@ struct SavedTab {
     layout: Option<Node<SavedPane>>,
 }
 
-/// Only the layout: anything that isn't an editor comes back as a plain shell.
+/// Only the layout: anything that isn't an editor or an agent comes back as a
+/// plain shell.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
 struct SavedPane {
     #[serde(default)]
     editor: bool,
     #[serde(default)]
     explorer: bool,
+    /// Restarted with the `[agent] command` configured at the time.
+    #[serde(default)]
+    agent: bool,
 }
 
 /// The saved state; a missing file means a first start.
@@ -402,6 +407,7 @@ impl Workspace {
                     root.map(&mut |pane| SavedPane {
                         editor: pane.read(cx).kind == TerminalKind::Editor,
                         explorer: tab.explorers.contains_key(&pane.entity_id()),
+                        agent: matches!(pane.read(cx).kind, TerminalKind::Agent(_)),
                     })
                 });
                 let focus = tab.root.as_ref().and_then(|root| {
@@ -477,7 +483,12 @@ impl Workspace {
             let mut with_explorer = vec![];
             let root = saved_tab.layout.as_ref().map(|layout| {
                 layout.map(&mut |pane| {
-                    let kind = if pane.editor { TerminalKind::Editor } else { TerminalKind::Terminal };
+                    let agent = cx.global::<Config>().agent_command.clone().filter(|_| pane.agent);
+                    let kind = match agent {
+                        _ if pane.editor => TerminalKind::Editor,
+                        Some(command) => TerminalKind::Agent(command),
+                        None => TerminalKind::Terminal,
+                    };
                     let terminal = self.new_terminal(kind, false, window, cx);
                     if pane.editor && pane.explorer {
                         with_explorer.push(terminal.clone());
@@ -1056,6 +1067,25 @@ impl Workspace {
 
     fn new_editor(&mut self, _: &NewEditor, window: &mut Window, cx: &mut Context<Self>) {
         self.add_container(TerminalKind::Editor, Axis::Row, window, cx);
+    }
+
+    fn new_agent(&mut self, _: &NewAgent, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_agent(window, cx);
+    }
+
+    /// A container running `[agent] command`, or a warning if there is none.
+    fn start_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match cx.global::<Config>().agent_command.clone() {
+            Some(command) => self.add_container(TerminalKind::Agent(command), Axis::Row, window, cx),
+            None => {
+                let warning = "no coding agent set: add [agent] command = \"opencode\" (or claude, codex, ...) to the config".to_owned();
+                if !self.state_warnings.contains(&warning) {
+                    self.state_warnings.push(warning);
+                }
+                self.config_warnings_dismissed = false;
+                cx.notify();
+            }
+        }
     }
 
     fn close_focused(&mut self, _: &CloseContainer, window: &mut Window, cx: &mut Context<Self>) {
@@ -1813,6 +1843,10 @@ impl Workspace {
                         cx.listener(|this, _: &MouseDownEvent, window, cx| {
                             this.add_container(TerminalKind::Editor, Axis::Row, window, cx)
                         }),
+                    ))
+                    .child(modal_button("start-agent", with_key("Agent", "new_agent"), false, t).on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, window, cx| this.start_agent(window, cx)),
                     )),
             )
     }
@@ -1905,6 +1939,7 @@ impl Render for Workspace {
                 el.on_action(cx.listener(Self::split_right))
                     .on_action(cx.listener(Self::split_down))
                     .on_action(cx.listener(Self::new_editor))
+                    .on_action(cx.listener(Self::new_agent))
                     .on_action(cx.listener(Self::close_focused))
                     .on_action(cx.listener(Self::focus_left))
                     .on_action(cx.listener(Self::focus_right))
@@ -2028,7 +2063,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn pane(editor: bool, explorer: bool) -> Node<SavedPane> {
-        Node::Leaf(SavedPane { editor, explorer })
+        Node::Leaf(SavedPane { editor, explorer, agent: false })
     }
 
     #[test]
@@ -2045,7 +2080,7 @@ mod tests {
             second: Box::new(Node::Split {
                 axis: Axis::Col,
                 ratio: 0.3,
-                first: Box::new(pane(false, false)),
+                first: Box::new(Node::Leaf(SavedPane { editor: false, explorer: false, agent: true })),
                 second: Box::new(pane(true, false)),
             }),
         };

@@ -113,6 +113,7 @@ const ACTIONS: &[(&str, &str, fn() -> Box<dyn Action>)] = &[
     ("split_right", "alt-enter", || Box::new(SplitRight)),
     ("split_down", "alt-shift-enter", || Box::new(SplitDown)),
     ("new_editor", "alt-o", || Box::new(NewEditor)),
+    ("new_agent", "alt-a", || Box::new(NewAgent)),
     ("close_container", "alt-q", || Box::new(CloseContainer)),
     ("close_workspace", "alt-shift-q", || Box::new(CloseWorkspace)),
     ("new_workspace", "alt-shift-n", || Box::new(NewWorkspace)),
@@ -152,6 +153,8 @@ pub struct Config {
     keys: HashMap<&'static str, Vec<String>>,
     /// Floating terminals that run a command, each on its own key.
     pub floating_commands: Vec<FloatingCommand>,
+    /// What agent containers run (`[agent] command`).
+    pub agent_command: Option<String>,
     /// Problems found while loading, shown to the user.
     pub warnings: Vec<String>,
     /// Take colors from the Helix theme (`[colors] use_helix_theme`).
@@ -183,6 +186,7 @@ impl Default for Config {
                 .map(|(name, key, _)| (*name, vec![key.to_string()]))
                 .collect(),
             floating_commands: vec![],
+            agent_command: None,
             warnings: vec![],
             use_helix_theme: false,
             dark: true,
@@ -210,6 +214,13 @@ struct File {
     colors: ColorsFile,
     keybindings: HashMap<String, Keys>,
     floating_commands: Vec<FloatingCommandFile>,
+    agent: AgentFile,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct AgentFile {
+    command: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -397,6 +408,8 @@ impl Config {
             Some(side) => config.warnings.push(format!("explorer.side \"{side}\" ignored (allowed: left, right)")),
         }
 
+        config.agent_command = file.agent.command.filter(|c| !c.trim().is_empty());
+
         config.use_helix_theme = file.colors.use_helix_theme;
         for (section, colors) in [("ui", &file.colors.ui), ("terminal", &file.colors.terminal)] {
             for (name, value) in colors {
@@ -576,6 +589,9 @@ mod tests {
             [explorer]
             side = "left"
 
+            [agent]
+            command = "opencode --continue"
+
             [colors.ui]
             accent = "#7aa2f7"
 
@@ -592,6 +608,8 @@ mod tests {
         assert_eq!(config.font_size, 17.);
         assert_eq!(config.padding, 10.);
         assert!(config.explorer_left);
+        assert_eq!(config.agent_command.as_deref(), Some("opencode --continue"));
+        assert_eq!(Config::parse("[agent]\ncommand = \" \"").agent_command, None);
         assert_eq!(config.ui.accent, 0x7aa2f7);
         assert_eq!(config.ui.text, UiColors::default().text);
         assert_eq!(config.terminal.ansi[9], 0xff0000);

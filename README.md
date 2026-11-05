@@ -29,6 +29,8 @@ panes are just how the project is laid out.
 - **Tools around the editor**: shells in manual, Sway-style splits, tabs per
   workspace, and floating terminals, including ones that run a command on a
   key (lazygit on `Alt+G`, say).
+- **Coding agents next to the editor**: agent containers run your preferred
+  agent (OpenCode, Claude Code, Codex, pi, ...) in the project on `Alt+A`.
 - **Arrange it your way**: management mode to select and resize containers,
   maximize one, scroll back with a Helix-style copy mode.
 - **A config file** for fonts, colors and every keybinding.
@@ -143,6 +145,19 @@ Press the key to open it, again to hide / show it (it keeps running); it
 closes when the command exits. Add as many as you like. Commands run through
 your shell (`$SHELL -l -i -c`), so your `PATH`, aliases and arguments work.
 
+Agent containers run your coding agent (OpenCode, Claude Code, Codex, pi, ...)
+in the workspace folder, on `Alt+A` or the **Agent** button of an empty tab:
+
+```toml
+[agent]
+command = "opencode"   # any command with arguments, e.g. "claude", "opencode --continue"
+```
+
+They run through your shell like floating commands, and come back with the
+workspace on the next start (as a new run of the command; use the agent's own
+resume flag, like `--continue`, to pick up where it left off). Every container
+has `HELTERM=1` set, so scripts and agent hooks can tell they run in Helterm.
+
 A key can belong to only one action. If two actions share a key, a key you set
 yourself wins over a default; between two of yours, the one listed first in
 `config.example.toml` keeps it, then `[[floating_commands]]` in file order.
@@ -189,6 +204,7 @@ Close a tab with the `×` on its title, or by closing its last container.
 | `Alt+Enter` | New terminal, split to the right | `split_right` |
 | `Alt+Shift+Enter` | New terminal, split below | `split_down` |
 | `Alt+O` | New Helix editor, split to the right | `new_editor` |
+| `Alt+A` | New coding agent (`[agent] command`), split to the right | `new_agent` |
 | `Alt+Q` | Close the focused container | `close_container` |
 | `Alt+H` / `Alt+J` / `Alt+K` / `Alt+L` | Move focus left / down / up / right | `focus_left` / `focus_down` / `focus_up` / `focus_right` |
 | `Alt+Z` | Maximize / restore the focused container (like tmux's zoom) | `toggle_maximize` |
