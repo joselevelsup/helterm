@@ -158,6 +158,70 @@ workspace on the next start (as a new run of the command; use the agent's own
 resume flag, like `--continue`, to pick up where it left off). Every container
 has `HELTERM=1` set, so scripts and agent hooks can tell they run in Helterm.
 
+### When an agent is done or needs you
+
+Any container can ask for your attention: by ringing the terminal bell, or
+with a desktop notification sequence (OSC 9 or OSC 777). Helterm's own signal
+also says which it is:
+
+```sh
+printf '\033]777;notify;helterm;done\007'    # finished: green border
+printf '\033]777;notify;helterm;input\007'   # needs you: thick yellow border
+```
+
+A bell or any other notification counts as "needs you". Unless you're already
+looking at the container, its border changes color, its tab and workspace (in
+the switcher) get a dot, and, when the container is out of sight or Helterm
+isn't the active window, a desktop notification pops up (through
+`notify-send`). It all clears once you focus the container.
+
+Hook your agent up to send them. Hooks don't write to the terminal on their
+own, so the snippets print to `/dev/tty`:
+
+**Claude Code** (`~/.claude/settings.json`):
+
+```json
+{
+  "hooks": {
+    "Stop": [{ "hooks": [{ "type": "command",
+      "command": "[ -n \"$HELTERM\" ] && printf '\\033]777;notify;helterm;done\\007' > /dev/tty || true" }] }],
+    "Notification": [{ "matcher": "permission_prompt|elicitation_dialog", "hooks": [{ "type": "command",
+      "command": "[ -n \"$HELTERM\" ] && printf '\\033]777;notify;helterm;input\\007' > /dev/tty || true" }] }]
+  }
+}
+```
+
+**OpenCode** (`~/.config/opencode/plugins/helterm.js`):
+
+```js
+import { writeFileSync } from "node:fs"
+
+const signal = (what) => {
+  if (!process.env.HELTERM) return
+  try { writeFileSync("/dev/tty", `\x1b]777;notify;helterm;${what}\x07`) } catch {}
+}
+
+export const Helterm = async () => ({
+  event: async ({ event }) => {
+    if (event.type === "session.idle") signal("done")
+    if (event.type === "permission.asked") signal("input")
+  },
+})
+```
+
+**Codex** (`~/.codex/config.toml`) sends notifications itself; they show as
+"needs you":
+
+```toml
+[tui]
+notifications = true
+notification_method = "osc9"
+notification_condition = "always"   # Helterm doesn't report focus to programs
+```
+
+**Other agents** (pi, ...): anything that rings the bell or sends OSC 9 works;
+for "done" vs "needs you", have its hooks or extensions print the lines above.
+
 A key can belong to only one action. If two actions share a key, a key you set
 yourself wins over a default; between two of yours, the one listed first in
 `config.example.toml` keeps it, then `[[floating_commands]]` in file order.

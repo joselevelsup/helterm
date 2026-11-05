@@ -290,6 +290,11 @@ pub struct TerminalView {
 
 impl EventEmitter<Exited> for TerminalView {}
 
+/// Emitted when `attention` changes: set by the program, or cleared once seen.
+pub struct AttentionChanged;
+
+impl EventEmitter<AttentionChanged> for TerminalView {}
+
 /// Cell under a position measured from the grid's top-left corner, plus which
 /// half of the cell it is on. Positions outside the grid clamp to its edges.
 fn cell_at(x: f32, y: f32, cell: (f32, f32), grid: (usize, usize)) -> (usize, usize, Side) {
@@ -684,7 +689,12 @@ impl TerminalView {
                     last_redraw = std::time::Instant::now();
                 }
                 let fed = this.update(cx, |view, cx| {
+                    let attention = view.attention;
                     view.feed(&bytes);
+                    if view.attention != attention {
+                        cx.emit(AttentionChanged);
+                        cx.notify();
+                    }
                     if redraw {
                         cx.notify();
                     }
@@ -1414,8 +1424,8 @@ impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let focused = self.focus_handle.is_focused(window);
         // Seen: focus and window activation changes redraw every pane.
-        if focused && window.is_window_active() {
-            self.attention = None;
+        if focused && window.is_window_active() && self.attention.take().is_some() {
+            cx.emit(AttentionChanged); // so tab and workspace dots go too
         }
         // Where we are in the history, like tmux's [12/340]; only when not at the bottom.
         let grid = self.term.grid();

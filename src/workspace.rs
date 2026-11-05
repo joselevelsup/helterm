@@ -10,7 +10,7 @@ use gpui::{
 use crate::config::{Config, UiColors, ui};
 use crate::container::{Axis, FocusDir, Node, Placement};
 use crate::explorer::FileExplorer;
-use crate::terminal::{Exited, TerminalKind, TerminalView};
+use crate::terminal::{Attention, AttentionChanged, Exited, TerminalKind, TerminalView};
 
 actions!(
     workspace,
@@ -80,6 +80,17 @@ impl Tab {
             float.visible = Some(i) == ix;
         }
     }
+}
+
+/// Every container of a tab, tiled and floating.
+fn tab_terminals(tab: &Tab) -> impl Iterator<Item = &Entity<TerminalView>> {
+    tab.root.iter().flat_map(|root| root.leaves()).chain(tab.floats.iter().map(|f| &f.terminal))
+}
+
+/// What the tabs' containers want, needing input first: the dot's color.
+fn tabs_attention<'a>(tabs: impl IntoIterator<Item = &'a Tab>, cx: &App) -> Option<Attention> {
+    let all = tabs.into_iter().flat_map(tab_terminals).filter_map(|t| t.read(cx).attention);
+    all.reduce(|a, b| if b == Attention::Input { b } else { a })
 }
 
 /// What a floating terminal belongs to, i.e. which key toggles it.
@@ -623,7 +634,55 @@ impl Workspace {
             this.remove_container(terminal.entity_id(), window, cx);
         })
         .detach();
+        cx.subscribe_in(&terminal, window, |this, terminal, _: &AttentionChanged, window, cx| {
+            this.attention_changed(terminal, window, cx);
+        })
+        .detach();
         terminal
+    }
+
+    /// A container signalled (or was seen): update the dots, and tell the
+    /// desktop unless the container is in plain sight.
+    fn attention_changed(&mut self, terminal: &Entity<TerminalView>, window: &mut Window, cx: &mut Context<Self>) {
+        cx.notify();
+        let Some(attention) = terminal.read(cx).attention else {
+            return;
+        };
+        let id = terminal.entity_id();
+        let Some((p, t)) = self.projects.iter().enumerate().find_map(|(p, project)| {
+            project.tabs.iter().position(|tab| tab_terminals(tab).any(|term| term.entity_id() == id)).map(|t| (p, t))
+        }) else {
+            return;
+        };
+        let project = &self.projects[p];
+        let tab = &project.tabs[t];
+        let on_screen = p == self.active
+            && t == project.active
+            && match tab.float_index(id) {
+                Some(ix) => tab.floats[ix].visible,
+                None => tab.maximized.is_none_or(|max| max == id),
+            };
+        if window.is_window_active() && on_screen {
+            if terminal.read(cx).focus_handle(cx).is_focused(window) {
+                // Already looking at it: nothing to point out.
+                terminal.update(cx, |terminal, cx| {
+                    terminal.attention = None;
+                    cx.notify();
+                });
+            }
+            return; // its border shows it
+        }
+        let (urgency, body) = match attention {
+            Attention::Done => ("normal", "Finished"),
+            Attention::Input => ("critical", "Needs your attention"),
+        };
+        let summary = format!("{} · Tab {}", project.name(), tab.number);
+        // Reaped on its own thread; no notification daemon just means no popup.
+        std::thread::spawn(move || {
+            let _ = std::process::Command::new("notify-send")
+                .args(["--app-name=Helterm", "--urgency", urgency, &summary, body])
+                .status();
+        });
     }
 
     fn new_explorer(&self, editor: Entity<TerminalView>, cx: &mut Context<Self>) -> Entity<FileExplorer> {
@@ -1406,6 +1465,7 @@ impl Workspace {
                     MouseButton::Left,
                     cx.listener(move |this, _: &MouseDownEvent, window, cx| this.pick_workspace(ix, window, cx)),
                 )
+                .children(attention_dot(tabs_attention(&project.tabs, cx), t))
                 .child(
                     div()
                         .flex_none()
@@ -1621,6 +1681,7 @@ impl Workspace {
                         this.activate_tab(ix, window, cx)
                     }),
                 )
+                .children(attention_dot(tabs_attention([tab], cx), t))
                 .child(format!("Tab {}", tab.number))
                 .child(
                     div()
@@ -2042,6 +2103,15 @@ fn modal_panel(title: impl Into<SharedString>, t: UiColors) -> Div {
         .border_color(rgb(t.border))
         .text_size(px(13.))
         .child(div().text_size(px(15.)).text_color(rgb(t.accent)).child(title.into()))
+}
+
+/// Dot on a tab or workspace with a container waiting to be looked at.
+fn attention_dot(attention: Option<Attention>, t: UiColors) -> Option<Div> {
+    let color = match attention? {
+        Attention::Done => t.success,
+        Attention::Input => t.warning,
+    };
+    Some(div().flex_none().size(px(7.)).rounded_full().bg(rgb(color)))
 }
 
 fn modal_button(id: &'static str, label: impl Into<SharedString>, primary: bool, t: UiColors) -> Stateful<Div> {
