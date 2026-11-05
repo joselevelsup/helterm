@@ -169,6 +169,9 @@ struct Row {
     depth: usize,
 }
 
+/// Width of the panel, in pixels.
+pub const WIDTH: f32 = 240.;
+
 /// File tree panel shown next to editor containers.
 pub struct FileExplorer {
     root: PathBuf,
@@ -551,7 +554,7 @@ impl Render for FileExplorer {
             .flex()
             .flex_none()
             .flex_col()
-            .w(px(240.))
+            .w(px(WIDTH))
             .h_full()
             .bg(rgb(t.panel))
             .border_1()

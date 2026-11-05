@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use gpui::{
-    App, Context, Div, Entity, EntityId, FocusHandle, Hsla, Focusable, KeyDownEvent, ModifiersChangedEvent,
-    MouseButton, MouseDownEvent, PathPromptOptions, Render, SharedString, Stateful, Window, actions, div, hsla,
+    AnyView, App, Context, Div, Entity, EntityId, FocusHandle, Hsla, Focusable, KeyDownEvent, ModifiersChangedEvent,
+    MouseButton, MouseDownEvent, PathPromptOptions, Render, SharedString, Stateful, StyleRefinement, WeakEntity, Window, actions, div, hsla,
     WindowAppearance, prelude::*, px, relative, rgb,
 };
 
@@ -108,6 +108,9 @@ struct Project {
     tabs: Vec<Tab>,
     active: usize,
     next_tab_number: usize,
+    /// Saved layout not started yet: panes only spawn once the workspace is
+    /// first opened. Until then `tabs` is empty.
+    pending: Option<SavedWorkspace>,
 }
 
 impl Project {
@@ -176,6 +179,10 @@ pub struct Workspace {
     window_title: String,
     /// Focus target of the empty-tab screen, so keybindings work with no containers.
     empty_focus: FocusHandle,
+    /// Last state handed to the writer, so it's only written when it changed.
+    last_saved: Option<Saved>,
+    /// Hands states to the background writer; `None` without a state path.
+    save_tx: Option<async_channel::Sender<Saved>>,
 }
 
 /// How much one resize key press grows / shrinks a pane (share of its split).
@@ -199,34 +206,55 @@ fn next_dup(taken: &[usize]) -> usize {
     (1..).find(|n| !taken.contains(n)).unwrap()
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Default)]
+/// Everything remembered between runs. Older files (only `path`s) still load.
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone, Debug, PartialEq)]
 struct Saved {
+    /// The workspace that was open.
+    #[serde(default)]
+    active: usize,
     #[serde(default)]
     workspace: Vec<SavedWorkspace>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
 struct SavedWorkspace {
     path: PathBuf,
+    #[serde(default)]
+    active_tab: usize,
+    #[serde(default)]
+    tab: Vec<SavedTab>,
 }
 
-/// Saved workspace folders in switcher order; a missing file means none.
-fn load_saved(path: &std::path::Path) -> Result<Vec<PathBuf>, String> {
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+struct SavedTab {
+    /// Position (in `leaves()` order) of the pane that had focus.
+    #[serde(default)]
+    focus: usize,
+    /// `None`: an empty tab.
+    layout: Option<Node<SavedPane>>,
+}
+
+/// Only the layout: anything that isn't an editor comes back as a plain shell.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+struct SavedPane {
+    #[serde(default)]
+    editor: bool,
+    #[serde(default)]
+    explorer: bool,
+}
+
+/// The saved state; a missing file means a first start.
+fn load_saved(path: &std::path::Path) -> Result<Saved, String> {
     match std::fs::read_to_string(path) {
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(vec![]),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Saved::default()),
         Err(err) => Err(err.to_string()),
-        Ok(text) => toml::from_str::<Saved>(&text)
-            .map(|saved| saved.workspace.into_iter().map(|w| w.path).collect())
-            .map_err(|err| err.message().to_owned()),
+        Ok(text) => toml::from_str::<Saved>(&text).map_err(|err| err.message().to_owned()),
     }
 }
 
 /// Write via a temp file + rename so a crash never leaves a half-written list.
-fn write_saved(path: &std::path::Path, folders: &[PathBuf]) -> std::io::Result<()> {
-    let saved = Saved {
-        workspace: folders.iter().map(|path| SavedWorkspace { path: path.clone() }).collect(),
-    };
-    let text = toml::to_string(&saved).map_err(std::io::Error::other)?;
+fn write_saved(path: &std::path::Path, saved: &Saved) -> std::io::Result<()> {
+    let text = toml::to_string(saved).map_err(std::io::Error::other)?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -253,13 +281,19 @@ impl Workspace {
             state_warnings: vec![],
             window_title: String::new(),
             empty_focus: cx.focus_handle(),
+            last_saved: None,
+            save_tx: None,
         };
         if let Some(path) = crate::config::state_path() {
+            this.save_tx = Some(Self::spawn_writer(path.clone(), cx));
             match load_saved(&path) {
-                Ok(folders) => {
-                    for folder in folders {
-                        this.open_project(folder, window, cx);
+                Ok(saved) => {
+                    for workspace in &saved.workspace {
+                        this.push_project(workspace.path.clone(), Some(workspace.clone()));
                     }
+                    this.active = saved.active.min(this.projects.len().saturating_sub(1));
+                    this.load_active(window, cx);
+                    this.last_saved = Some(saved);
                 }
                 Err(err) => {
                     // Keep the unreadable file instead of overwriting it on the next save.
@@ -272,7 +306,6 @@ impl Workspace {
                 }
             }
         }
-        this.active = 0;
         this.focus_active_tab(window, cx);
         // Leaving the window while holding the switch key: the release never arrives.
         cx.observe_window_activation(window, |this, window, cx| {
@@ -357,16 +390,152 @@ impl Workspace {
         .detach();
     }
 
-    /// Remember the workspace list (folders in switcher order) for the next start.
-    fn save(&mut self) {
-        let Some(path) = crate::config::state_path() else {
+    /// Workspaces, tabs and layouts as they are now. Workspaces not opened yet
+    /// keep their saved layout untouched.
+    fn snapshot(&self, cx: &App) -> Saved {
+        let workspace = self.projects.iter().map(|project| {
+            if let Some(pending) = &project.pending {
+                return pending.clone();
+            }
+            let tab = project.tabs.iter().map(|tab| {
+                let layout = tab.root.as_ref().map(|root| {
+                    root.map(&mut |pane| SavedPane {
+                        editor: pane.read(cx).kind == TerminalKind::Editor,
+                        explorer: tab.explorers.contains_key(&pane.entity_id()),
+                    })
+                });
+                let focus = tab.root.as_ref().and_then(|root| {
+                    root.leaves().iter().position(|pane| Some(pane.entity_id()) == tab.last_focus)
+                });
+                SavedTab { focus: focus.unwrap_or(0), layout }
+            });
+            SavedWorkspace { path: project.root.clone(), active_tab: project.active, tab: tab.collect() }
+        });
+        Saved { active: self.active, workspace: workspace.collect() }
+    }
+
+    /// Remember everything for the next start, if anything changed since last time.
+    fn save(&mut self, window: &Window, cx: &App) {
+        // The focused pane is otherwise only recorded when leaving its tab.
+        self.remember_focus(window, cx);
+        let saved = self.snapshot(cx);
+        if self.last_saved.as_ref() == Some(&saved) {
+            return;
+        }
+        if let Some(tx) = &self.save_tx {
+            let _ = tx.try_send(saved.clone());
+        }
+        self.last_saved = Some(saved);
+    }
+
+    /// Writes states off the UI thread, one at a time and in order, so an older
+    /// state never lands after a newer one. States queued meanwhile are skipped
+    /// for the newest.
+    fn spawn_writer(path: PathBuf, cx: &mut Context<Self>) -> async_channel::Sender<Saved> {
+        let (tx, rx) = async_channel::unbounded::<Saved>();
+        cx.spawn(async move |this, cx| {
+            while let Ok(mut saved) = rx.recv().await {
+                while let Ok(newer) = rx.try_recv() {
+                    saved = newer;
+                }
+                let path = path.clone();
+                let write = cx.background_executor().spawn(async move { write_saved(&path, &saved).map_err(|e| (path, e)) });
+                if let Err((path, err)) = write.await {
+                    let shown = this.update(cx, |this, cx| {
+                        let warning = format!("could not save workspaces to {}: {err}", path.display());
+                        if !this.state_warnings.contains(&warning) {
+                            this.state_warnings.push(warning);
+                            this.config_warnings_dismissed = false;
+                            cx.notify();
+                        }
+                    });
+                    if shown.is_err() {
+                        return;
+                    }
+                }
+            }
+        })
+        .detach();
+        tx
+    }
+
+    /// Start the saved panes of the active workspace, the first time it's opened.
+    fn load_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(saved) = self.projects.get_mut(self.active).and_then(|p| p.pending.take()) else {
             return;
         };
-        let folders: Vec<PathBuf> = self.projects.iter().map(|p| p.root.clone()).collect();
-        if let Err(err) = write_saved(&path, &folders) {
-            self.state_warnings.push(format!("could not save workspaces to {}: {err}", path.display()));
+        // A shell can't start in a missing folder.
+        if !saved.path.is_dir() {
+            self.state_warnings.push(format!("{}: folder not found, its layout was not restored", saved.path.display()));
             self.config_warnings_dismissed = false;
+            self.open_tab(window, cx);
+            return;
         }
+        // The active tab's panes start first.
+        let mut to_start = vec![];
+        for (ix, saved_tab) in saved.tab.iter().enumerate() {
+            let mut with_explorer = vec![];
+            let root = saved_tab.layout.as_ref().map(|layout| {
+                layout.map(&mut |pane| {
+                    let kind = if pane.editor { TerminalKind::Editor } else { TerminalKind::Terminal };
+                    let terminal = self.new_terminal(kind, false, window, cx);
+                    if pane.editor && pane.explorer {
+                        with_explorer.push(terminal.clone());
+                    }
+                    to_start.push((ix != saved.active_tab, terminal.downgrade()));
+                    terminal
+                })
+            });
+            let mut explorers = HashMap::new();
+            for editor in with_explorer {
+                editor.update(cx, |editor, cx| {
+                    editor.explorer_open = true;
+                    cx.notify();
+                });
+                explorers.insert(editor.entity_id(), self.new_explorer(editor, cx));
+            }
+            let last_focus = root.as_ref().and_then(|root| root.leaves().get(saved_tab.focus).map(|t| t.entity_id()));
+            let project = self.project_mut();
+            project.tabs.push(Tab {
+                number: project.next_tab_number,
+                root,
+                explorers,
+                last_focus,
+                maximized: None,
+                floats: vec![],
+            });
+            project.next_tab_number += 1;
+        }
+        to_start.sort_by_key(|(later, _)| *later);
+        Self::start_one_by_one(to_start.into_iter().map(|(_, pane)| pane).collect(), cx);
+        let project = self.project_mut();
+        if project.tabs.is_empty() {
+            self.open_tab(window, cx);
+        } else {
+            project.active = saved.active_tab.min(project.tabs.len() - 1);
+        }
+    }
+
+    /// Start restored panes slightly apart: the next once the previous has
+    /// printed something or after WAIT. Started together, shells race over
+    /// locks in their startup scripts (Oh My Bash's update check prints "Failed
+    /// to get a lock"); those locks are held for milliseconds, so a small offset
+    /// is enough. Panes closed meanwhile are skipped.
+    /// shortcut: a fixed offset, not a guarantee; raise WAIT if the error returns.
+    fn start_one_by_one(panes: Vec<WeakEntity<TerminalView>>, cx: &mut Context<Self>) {
+        const WAIT: std::time::Duration = std::time::Duration::from_millis(150);
+        cx.spawn(async move |_, cx| {
+            for pane in panes {
+                let Ok(first_output) = pane.update(cx, |pane, cx| pane.start(cx)) else {
+                    continue;
+                };
+                let started = std::time::Instant::now();
+                while !first_output.is_closed() && started.elapsed() < WAIT {
+                    cx.background_executor().timer(std::time::Duration::from_millis(20)).await;
+                }
+            }
+        })
+        .detach();
     }
 
     fn project(&self) -> &Project {
@@ -422,15 +591,23 @@ impl Workspace {
         self.tab().root.as_ref().is_some_and(|root| root.contains(id.as_u64()))
     }
 
-    /// Spawn a terminal in the active workspace's folder.
+    /// A terminal in the active workspace's folder. Its program runs right away
+    /// unless `start` is false (see `start_one_by_one`).
     fn new_terminal(
         &self,
         kind: TerminalKind,
+        start: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<TerminalView> {
         let cwd = self.project().root.clone();
-        let terminal = cx.new(|cx| TerminalView::new(kind, cwd, cx));
+        let terminal = cx.new(|cx| {
+            let mut view = TerminalView::new(kind, cwd, cx);
+            if start {
+                view.start(cx);
+            }
+            view
+        });
         cx.subscribe_in(&terminal, window, |this, terminal, _: &Exited, window, cx| {
             this.remove_container(terminal.entity_id(), window, cx);
         })
@@ -481,6 +658,14 @@ impl Workspace {
 
     /// Add a workspace for `root` at the end of the list and switch to it.
     fn open_project(&mut self, root: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.remember_focus(window, cx);
+        self.push_project(root, None);
+        self.active = self.projects.len() - 1;
+        self.open_tab(window, cx);
+    }
+
+    /// Add a workspace at the end of the list, with no tabs yet.
+    fn push_project(&mut self, root: PathBuf, pending: Option<SavedWorkspace>) {
         let base = root
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -491,7 +676,6 @@ impl Workspace {
             .filter(|p| p.base == base)
             .map(|p| p.dup)
             .collect();
-        self.remember_focus(window, cx);
         self.projects.push(Project {
             dup: next_dup(&taken),
             base,
@@ -499,14 +683,14 @@ impl Workspace {
             tabs: vec![],
             active: 0,
             next_tab_number: 1,
+            pending,
         });
-        self.active = self.projects.len() - 1;
-        self.open_tab(window, cx);
     }
 
     fn activate_project(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.remember_focus(window, cx);
         self.active = ix;
+        self.load_active(window, cx);
         self.focus_active_tab(window, cx);
         cx.notify();
     }
@@ -521,9 +705,9 @@ impl Workspace {
             len => active_after_close(self.active, ix, len),
         };
         if was_active {
+            self.load_active(window, cx);
             self.focus_active_tab(window, cx);
         }
-        self.save();
         cx.notify();
     }
 
@@ -706,7 +890,6 @@ impl Workspace {
             return;
         };
         self.open_project(modal.folder.unwrap_or_else(home_dir), window, cx);
-        self.save();
     }
 
     fn cancel_new_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -843,7 +1026,7 @@ impl Workspace {
         if self.tab().root.is_some() && anchor.is_none() {
             return; // e.g. the floating terminal is focused
         }
-        let container = self.new_terminal(kind, window, cx);
+        let container = self.new_terminal(kind, true, window, cx);
         let tab = self.tab_mut();
         // The new container would be hidden behind a maximized one.
         tab.maximized = None;
@@ -1043,7 +1226,7 @@ impl Workspace {
                         TerminalKind::Command(command.command.clone())
                     }
                 };
-                let terminal = self.new_terminal(kind, window, cx);
+                let terminal = self.new_terminal(kind, true, window, cx);
                 let tab = self.tab_mut();
                 tab.floats.push(Floating {
                     terminal,
@@ -1153,12 +1336,18 @@ impl Workspace {
         match self.tab().explorers.get(&id).cloned() {
             Some(explorer) if explorer.read(cx).focus_handle(cx).is_focused(window) => {
                 self.tab_mut().explorers.remove(&id);
-                editor.update(cx, |editor, _| editor.explorer_open = false);
+                editor.update(cx, |editor, cx| {
+                    editor.explorer_open = false;
+                    cx.notify();
+                });
                 editor.read(cx).focus_handle(cx).focus(window);
             }
             Some(explorer) => explorer.read(cx).focus_handle(cx).focus(window),
             None => {
-                editor.update(cx, |editor, _| editor.explorer_open = true);
+                editor.update(cx, |editor, cx| {
+                    editor.explorer_open = true;
+                    cx.notify();
+                });
                 let explorer = self.new_explorer(editor, cx);
                 explorer.read(cx).focus_handle(cx).focus(window);
                 self.tab_mut().explorers.insert(id, explorer);
@@ -1631,13 +1820,20 @@ impl Workspace {
     fn render_node(&self, tab: &Tab, node: &Node<Entity<TerminalView>>, t: UiColors, explorer_left: bool) -> Div {
         match node {
             Node::Leaf(terminal) => {
+                // Cached: a pane only redraws when it notifies (or on focus / theme
+                // changes, which refresh the whole window), not when a neighbour does.
+                let pane = AnyView::from(terminal.clone())
+                    .cached(StyleRefinement::default().flex_1().min_w_0().min_h_0());
                 // No gap: the explorer is joined to its editor's edge.
-                let mut el = div().relative().flex().flex_1().min_w_0().min_h_0().child(terminal.clone());
+                let mut el = div().relative().flex().flex_1().min_w_0().min_h_0().child(pane);
                 if explorer_left {
                     el = el.flex_row_reverse();
                 }
                 if let Some(explorer) = tab.explorers.get(&terminal.entity_id()) {
-                    el = el.child(explorer.clone());
+                    el = el.child(
+                        AnyView::from(explorer.clone())
+                            .cached(StyleRefinement::default().flex_none().w(px(crate::explorer::WIDTH))),
+                    );
                 }
                 let selected = self.manage.as_ref().is_some_and(|m| m.selected == terminal.entity_id());
                 if selected {
@@ -1686,6 +1882,8 @@ impl Render for Workspace {
             window.set_window_title(&title);
             self.window_title = title;
         }
+        // Every layout, tab or focus change ends in a redraw: save then, if changed.
+        self.save(window, cx);
         let t = ui(cx);
         div()
             .relative()
@@ -1825,25 +2023,63 @@ fn modal_button(id: &'static str, label: impl Into<SharedString>, primary: bool,
 
 #[cfg(test)]
 mod tests {
-    use super::{active_after_close, load_saved, next_dup, write_saved};
+    use super::{Saved, SavedPane, SavedTab, SavedWorkspace, active_after_close, load_saved, next_dup, write_saved};
+    use crate::container::{Axis, Node};
     use std::path::PathBuf;
 
+    fn pane(editor: bool, explorer: bool) -> Node<SavedPane> {
+        Node::Leaf(SavedPane { editor, explorer })
+    }
+
     #[test]
-    fn saved_workspaces_round_trip_in_order() {
+    fn saved_state_round_trips_with_layouts() {
         let dir = std::env::temp_dir().join(format!("helterm_state_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("helterm").join("workspaces.toml");
 
-        assert_eq!(load_saved(&path).unwrap(), Vec::<PathBuf>::new()); // first start
-        let folders = vec![PathBuf::from("/home/u/b"), PathBuf::from("/home/u/a"), PathBuf::from("/home/u")];
-        write_saved(&path, &folders).unwrap();
-        assert_eq!(load_saved(&path).unwrap(), folders);
-        write_saved(&path, &[]).unwrap(); // all closed
-        assert_eq!(load_saved(&path).unwrap(), Vec::<PathBuf>::new());
+        assert_eq!(load_saved(&path).unwrap(), Saved::default()); // first start
+        let layout = Node::Split {
+            axis: Axis::Row,
+            ratio: 0.65,
+            first: Box::new(pane(true, true)),
+            second: Box::new(Node::Split {
+                axis: Axis::Col,
+                ratio: 0.3,
+                first: Box::new(pane(false, false)),
+                second: Box::new(pane(true, false)),
+            }),
+        };
+        let saved = Saved {
+            active: 1,
+            workspace: vec![
+                SavedWorkspace { path: "/home/u/b".into(), active_tab: 0, tab: vec![] },
+                SavedWorkspace {
+                    path: "/home/u/a".into(),
+                    active_tab: 1,
+                    tab: vec![
+                        SavedTab { focus: 2, layout: Some(layout) },
+                        SavedTab { focus: 0, layout: None }, // empty tab
+                    ],
+                },
+            ],
+        };
+        write_saved(&path, &saved).unwrap();
+        assert_eq!(load_saved(&path).unwrap(), saved);
+        write_saved(&path, &Saved::default()).unwrap(); // all closed
+        assert_eq!(load_saved(&path).unwrap(), Saved::default());
 
         std::fs::write(&path, "[[workspace]\npath = ").unwrap();
         assert!(load_saved(&path).is_err());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn old_state_files_with_only_paths_still_load() {
+        let saved: Saved = toml::from_str("[[workspace]]\npath = \"/home/u/b\"\n\n[[workspace]]\npath = \"/home/u\"").unwrap();
+        assert_eq!(saved.active, 0);
+        let paths: Vec<PathBuf> = saved.workspace.iter().map(|w| w.path.clone()).collect();
+        assert_eq!(paths, vec![PathBuf::from("/home/u/b"), PathBuf::from("/home/u")]);
+        assert!(saved.workspace.iter().all(|w| w.tab.is_empty() && w.active_tab == 0));
     }
 
     #[test]

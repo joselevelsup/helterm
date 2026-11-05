@@ -4,7 +4,8 @@ use gpui::Entity;
 
 use crate::terminal::TerminalView;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Axis {
     /// Children side by side.
     Row,
@@ -42,7 +43,8 @@ const MIN_RATIO: f32 = 0.1;
 const MAX_RATIO: f32 = 1. - MIN_RATIO;
 
 /// Sway-style binary split tree. A leaf is one terminal; splits nest freely.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Node<L> {
     Leaf(L),
     Split {
@@ -52,6 +54,21 @@ pub enum Node<L> {
         first: Box<Node<L>>,
         second: Box<Node<L>>,
     },
+}
+
+impl<L> Node<L> {
+    /// The same tree (shape and sizes) with every leaf turned into `f(leaf)`.
+    pub fn map<M>(&self, f: &mut impl FnMut(&L) -> M) -> Node<M> {
+        match self {
+            Node::Leaf(l) => Node::Leaf(f(l)),
+            Node::Split { axis, ratio, first, second } => Node::Split {
+                axis: *axis,
+                ratio: *ratio,
+                first: Box::new(first.map(f)),
+                second: Box::new(second.map(f)),
+            },
+        }
+    }
 }
 
 impl<L: Leaf> Node<L> {
@@ -409,6 +426,18 @@ mod tests {
         tree.remove(2);
         assert!(tree.restore(&placement, 2));
         assert_eq!(tree, sized);
+    }
+
+    #[test]
+    fn map_keeps_shape_and_sizes() {
+        let mut tree = Node::Leaf(1u64);
+        tree.split_focused(1, Axis::Row, 2);
+        tree.split_focused(1, Axis::Col, 3);
+        tree.resize(1, Axis::Row, 0.2);
+        let doubled = tree.map(&mut |id| id * 10);
+        assert_eq!(doubled.map(&mut |id| id / 10), tree);
+        let ids: Vec<u64> = doubled.leaves().into_iter().copied().collect();
+        assert_eq!(ids, vec![10, 30, 20]);
     }
 
     #[test]

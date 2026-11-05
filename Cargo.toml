@@ -26,3 +26,6 @@ opt-level = 3
 # local patch of xattr 0.2.3 (ENOATTR const was dropped from libc on linux)
 [patch.crates-io]
 xattr = { path = "vendored/xattr" }
+# cosmic-text 0.14.2 (gpui's Linux shaper) with the ligature line-break fix from
+# 0.19 backported, so "->", "!=", ... form ligatures like "<-" does.
+cosmic-text = { path = "vendored/cosmic-text" }

@@ -22,7 +22,7 @@ use gpui::{
 
 actions!(terminal, [Copy, Paste, CopyMode, ZoomIn, ZoomOut, ZoomReset]);
 use crate::config::{Config, TermColors};
-use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize, SlavePty};
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum TerminalKind {
@@ -186,7 +186,10 @@ pub struct TerminalView {
     term: Term<PtyListener>,
     writer: PtyWriter,
     master: Box<dyn MasterPty + Send>,
-    killer: Box<dyn ChildKiller + Send + Sync>,
+    /// The program, until `start` runs it.
+    unstarted: Option<(Box<dyn SlavePty + Send>, CommandBuilder)>,
+    /// `None` until started.
+    killer: Option<Box<dyn ChildKiller + Send + Sync>>,
     exited: Arc<AtomicBool>,
     parser: Processor,
     cols: usize,
@@ -460,14 +463,8 @@ impl TerminalView {
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
         cmd.cwd(&cwd);
-        let mut child = pty
-            .slave
-            .spawn_command(cmd)
-            .expect("failed to spawn pty child");
-        let killer = child.clone_killer();
 
         let writer: PtyWriter = Arc::new(Mutex::new(pty.master.take_writer().expect("pty writer")));
-        let mut reader = pty.master.try_clone_reader().expect("pty reader");
         let colors = Arc::new(Mutex::new(cx.global::<Config>().terminal));
         let term = Term::new(
             TermConfig::default(),
@@ -491,6 +488,47 @@ impl TerminalView {
         })
         .detach();
 
+        Self {
+            kind,
+            explorer_open: false,
+            focus_handle: cx.focus_handle(),
+            term,
+            writer,
+            master: pty.master,
+            unstarted: Some((pty.slave, cmd)),
+            killer: None,
+            exited: Arc::new(AtomicBool::new(false)),
+            parser: Processor::new(),
+            cols: 80,
+            rows: 24,
+            grid_origin: gpui::Point::default(),
+            cell_size: Size::default(),
+            selecting: false,
+            scroll_remainder: 0.,
+            copy_mode: CopyModeState::default(),
+            zoom: 0.,
+            colors,
+            theme_seqs: ThemeSeqWatch::default(),
+            theme_reports: false,
+            dark: cx.global::<Config>().dark,
+        }
+    }
+
+    /// Run the program. Separate from `new` so restored panes can start one at a
+    /// time: shells starting together race over locks in their startup scripts
+    /// (Oh My Bash's update check). The returned channel closes once the program
+    /// first prints something, i.e. its startup is (mostly) done.
+    pub fn start(&mut self, cx: &mut Context<Self>) -> async_channel::Receiver<()> {
+        let (first_output, first_output_rx) = async_channel::bounded::<()>(1);
+        let Some((slave, cmd)) = self.unstarted.take() else {
+            return first_output_rx; // already started: the sender is gone, so it reads as closed
+        };
+        let mut child = slave.spawn_command(cmd).expect("failed to spawn pty child");
+        // The child has its own copy; ours would keep the pty open after it exits.
+        drop(slave);
+        self.killer = Some(child.clone_killer());
+        let mut reader = self.master.try_clone_reader().expect("pty reader");
+
         // Bounded: when we fall behind, the reader waits and the PTY slows the
         // program down, like other terminals. Unbounded, a flood (`yes`, cat of a
         // huge file) piled up in memory and Ctrl+C had to wait for the backlog.
@@ -498,10 +536,9 @@ impl TerminalView {
 
         // Closing the channel when the child exits ends the UI loop below even if
         // a background job still holds the pty open.
-        let exited = Arc::new(AtomicBool::new(false));
         {
             let tx = tx.clone();
-            let exited = exited.clone();
+            let exited = self.exited.clone();
             std::thread::spawn(move || {
                 let _ = child.wait();
                 exited.store(true, Ordering::SeqCst);
@@ -524,6 +561,7 @@ impl TerminalView {
         });
 
         cx.spawn(async move |this, cx| {
+            let mut first_output = Some(first_output);
             let mut busy_since = std::time::Instant::now();
             let mut last_redraw = std::time::Instant::now();
             while let Ok(mut bytes) = rx.recv().await {
@@ -550,6 +588,7 @@ impl TerminalView {
                 if fed.is_err() {
                     return;
                 }
+                drop(first_output.take());
                 // In a flood the queue never empties and this loop would hog the
                 // main thread. After a time budget, step back once so the window
                 // can draw and handle keys (Ctrl+C!), then carry on at full speed.
@@ -563,30 +602,7 @@ impl TerminalView {
             this.update(cx, |_, cx| cx.emit(Exited)).ok();
         })
         .detach();
-
-        Self {
-            kind,
-            explorer_open: false,
-            focus_handle: cx.focus_handle(),
-            term,
-            writer,
-            master: pty.master,
-            killer,
-            exited,
-            parser: Processor::new(),
-            cols: 80,
-            rows: 24,
-            grid_origin: gpui::Point::default(),
-            cell_size: Size::default(),
-            selecting: false,
-            scroll_remainder: 0.,
-            copy_mode: CopyModeState::default(),
-            zoom: 0.,
-            colors,
-            theme_seqs: ThemeSeqWatch::default(),
-            theme_reports: false,
-            dark: cx.global::<Config>().dark,
-        }
+        first_output_rx
     }
 
     fn feed(&mut self, bytes: &[u8]) {
@@ -784,8 +800,9 @@ impl Drop for TerminalView {
     fn drop(&mut self) {
         // The reader thread holds a dup of the pty fd, so dropping the master alone
         // would not hang up the child. Skip if already reaped (pid could be reused).
-        if !self.exited.load(Ordering::SeqCst) {
-            let _ = self.killer.kill();
+        let exited = self.exited.load(Ordering::SeqCst);
+        if let Some(killer) = self.killer.as_mut().filter(|_| !exited) {
+            let _ = killer.kill();
         }
     }
 }
