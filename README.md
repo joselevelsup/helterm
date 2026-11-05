@@ -117,7 +117,7 @@ side = "left"
 use_helix_theme = true
 
 # App chrome: tabs, explorer, dialogs. Colors are "#rrggbb".
-# background, panel, sidebar, element, border, text, muted, accent, error, warning
+# background, panel, sidebar, element, border, text, muted, accent, error, warning, success
 [colors.ui]
 accent = "#7aa2f7"
 

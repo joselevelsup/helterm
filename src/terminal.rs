@@ -127,6 +127,69 @@ struct PtyListener {
     writer: PtyWriter,
     /// Shared with the view, which keeps it current when the theme changes.
     colors: Arc<Mutex<TermColors>>,
+    /// The program rang the bell; the view takes it after parsing.
+    bell: Arc<AtomicBool>,
+}
+
+/// Why a container wants the user to look at it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Attention {
+    /// Its agent finished (Helterm's own `done` signal).
+    Done,
+    /// It needs input: a bell, any other notification, or Helterm's `input` signal.
+    Input,
+}
+
+/// Desktop notifications, which alacritty ignores: OSC 9 (iTerm2's, sent by
+/// Codex and Claude Code) and OSC 777 (urxvt's). Helterm's own signal is
+/// `OSC 777 ; notify ; helterm ; done|input`. Fed byte by byte, so sequences
+/// split across reads are seen.
+#[derive(Default)]
+struct NotifyWatch {
+    /// Inside `ESC ]`: the text so far.
+    osc: Option<Vec<u8>>,
+    /// The last byte was ESC.
+    esc: bool,
+}
+
+impl NotifyWatch {
+    fn push(&mut self, b: u8) -> Option<Attention> {
+        let after_esc = std::mem::replace(&mut self.esc, b == 0x1b);
+        let Some(text) = self.osc.as_mut() else {
+            if after_esc && b == b']' {
+                self.osc = Some(vec![]);
+            }
+            return None;
+        };
+        // Ends with BEL or ESC \ (any ESC ends it, like in alacritty).
+        if b == 0x07 || b == 0x1b {
+            return notify_attention(&self.osc.take().unwrap());
+        }
+        if text.len() >= 1024 {
+            self.osc = None; // too long for a notification: some other OSC
+        } else {
+            text.push(b);
+        }
+        None
+    }
+}
+
+/// What an OSC's text (without `ESC ]`) asks for, if it is a notification.
+fn notify_attention(text: &[u8]) -> Option<Attention> {
+    let text = String::from_utf8_lossy(text);
+    if let Some(rest) = text.strip_prefix("777;notify;") {
+        return Some(match rest {
+            "helterm;done" => Attention::Done,
+            _ => Attention::Input,
+        });
+    }
+    let body = text.strip_prefix("9;")?;
+    // ConEmu's OSC 9;<number>;... (progress bars, cwd) are not notifications.
+    let first = body.split(';').next().unwrap_or_default();
+    if !first.is_empty() && first.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(Attention::Input)
 }
 
 /// Mode 2031 sequences (light / dark mode), which alacritty ignores: Helix asks
@@ -174,6 +237,10 @@ impl EventListener for PtyListener {
                     b: c as u8,
                 })
             }
+            TermEvent::Bell => {
+                self.bell.store(true, Ordering::Relaxed);
+                return;
+            }
             _ => return,
         };
         let _ = self.writer.lock().unwrap().write_all(reply.as_bytes());
@@ -212,6 +279,10 @@ pub struct TerminalView {
     zoom: f32,
     colors: Arc<Mutex<TermColors>>,
     theme_seqs: ThemeSeqWatch,
+    notify_seqs: NotifyWatch,
+    bell: Arc<AtomicBool>,
+    /// The program signalled; cleared once the user looks (focus, window active).
+    pub attention: Option<Attention>,
     /// The program asked to hear about light / dark changes (mode 2031).
     theme_reports: bool,
     dark: bool,
@@ -492,12 +563,14 @@ impl TerminalView {
 
         let writer: PtyWriter = Arc::new(Mutex::new(pty.master.take_writer().expect("pty writer")));
         let colors = Arc::new(Mutex::new(cx.global::<Config>().terminal));
+        let bell = Arc::new(AtomicBool::new(false));
         let term = Term::new(
             TermConfig::default(),
             &Dims { cols: 80, rows: 24 },
             PtyListener {
                 writer: writer.clone(),
                 colors: colors.clone(),
+                bell: bell.clone(),
             },
         );
         // The Helix theme or the desktop's light / dark mode changed.
@@ -537,6 +610,9 @@ impl TerminalView {
             zoom: 0.,
             colors,
             theme_seqs: ThemeSeqWatch::default(),
+            notify_seqs: NotifyWatch::default(),
+            bell,
+            attention: None,
             theme_reports: false,
             dark: cx.global::<Config>().dark,
         }
@@ -643,6 +719,12 @@ impl TerminalView {
                 Some(ThemeSeq::Unsubscribe) => self.theme_reports = false,
                 None => {}
             }
+            if let Some(attention) = self.notify_seqs.push(*b) {
+                self.attention = Some(attention);
+            }
+        }
+        if self.bell.swap(false, Ordering::Relaxed) {
+            self.attention = Some(Attention::Input);
         }
     }
 
@@ -1331,6 +1413,10 @@ impl Element for TerminalElement {
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let focused = self.focus_handle.is_focused(window);
+        // Seen: focus and window activation changes redraw every pane.
+        if focused && window.is_window_active() {
+            self.attention = None;
+        }
         // Where we are in the history, like tmux's [12/340]; only when not at the bottom.
         let grid = self.term.grid();
         let (offset, history) = (grid.display_offset(), grid.history_size());
@@ -1348,10 +1434,17 @@ impl Render for TerminalView {
         };
         let config = cx.global::<Config>();
         let (family, size) = (config.font_family.clone(), config.font_size + self.zoom);
-        let (background, border) = (
-            config.terminal.background,
-            if focused { config.ui.accent } else { config.ui.element },
-        );
+        let background = config.terminal.background;
+        let border = match self.attention {
+            Some(Attention::Done) => config.ui.success,
+            Some(Attention::Input) => config.ui.warning,
+            None if focused => config.ui.accent,
+            None => config.ui.element,
+        };
+        // Needs input: a thicker border, taken from the padding so the grid
+        // (and the program's layout) doesn't change size.
+        let border_width = if self.attention == Some(Attention::Input) { 2. } else { 1. };
+        let padding = (config.padding + 1. - border_width).max(0.);
         div()
             .flex()
             .flex_1()
@@ -1406,7 +1499,7 @@ impl Render for TerminalView {
             .text_size(px(size))
             .line_height(px((size * 1.4).round()))
             .bg(rgb(background))
-            .border_1()
+            .border(px(border_width))
             .border_color(rgb(border))
             .map(|el| match (self.explorer_open, cx.global::<Config>().explorer_left) {
                 (false, _) => el.rounded_md(),
@@ -1414,7 +1507,7 @@ impl Render for TerminalView {
                 (true, true) => el.rounded_r_md(),
             })
             // Inner padding between the border and the text; the grid shrinks to fit.
-            .p(px(config.padding))
+            .p(px(padding))
             .relative()
             .child(TerminalElement { view: cx.entity() })
             .when_some(badge, |el, badge| {
@@ -1463,6 +1556,46 @@ mod tests {
         assert_eq!(theme_report(false), b"\x1b[?997;2n");
     }
 
+    #[test]
+    fn spots_notifications_even_split_across_reads() {
+        let seen = |chunks: &[&[u8]]| -> Vec<Attention> {
+            let mut watch = NotifyWatch::default();
+            chunks.iter().flat_map(|chunk| chunk.iter().filter_map(|b| watch.push(*b)).collect::<Vec<_>>()).collect()
+        };
+        use Attention::*;
+        // Helterm's own signals, BEL or ESC \ terminated, split anywhere.
+        assert_eq!(seen(&[b"x\x1b]777;notify;hel", b"term;done\x07"]), vec![Done]);
+        assert_eq!(seen(&[b"\x1b", b"]777;notify;helterm;input\x1b\\"]), vec![Input]);
+        // Other programs' notifications: OSC 9 (Codex, Claude Code) and 777.
+        assert_eq!(seen(&[b"\x1b]9;Agent turn complete\x07"]), vec![Input]);
+        assert_eq!(seen(&[b"\x1b]777;notify;Build;finished\x07"]), vec![Input]);
+        // Not notifications: titles, hyperlinks, ConEmu progress, plain text.
+        assert!(seen(&[b"\x1b]0;title\x07\x1b]8;;https://x\x1b\\", b"\x1b]9;4;1;50\x07 9;hi \x07"]).is_empty());
+        // An unterminated OSC doesn't swallow the next one.
+        assert_eq!(seen(&[b"\x1b]0;tit\x1b]9;hi\x07"]), vec![Input]);
+    }
+
+    #[test]
+    fn bell_is_seen_but_not_osc_terminators() {
+        let bell = Arc::new(AtomicBool::new(false));
+        let mut term = Term::new(
+            TermConfig::default(),
+            &Dims { cols: 80, rows: 24 },
+            PtyListener {
+                writer: Arc::new(Mutex::new(Box::new(std::io::sink()))),
+                colors: Arc::new(Mutex::new(TermColors::default())),
+                bell: bell.clone(),
+            },
+        );
+        let mut parser: Processor = Processor::new();
+        for b in b"\x1b]0;title\x07done" {
+            parser.advance(&mut term, *b);
+        }
+        assert!(!bell.load(Ordering::Relaxed));
+        parser.advance(&mut term, 0x07);
+        assert!(bell.load(Ordering::Relaxed));
+    }
+
     fn feed_and_capture(input: &[u8]) -> String {
         let out = Arc::new(Mutex::new(Vec::new()));
         let writer: PtyWriter = Arc::new(Mutex::new(Box::new(SharedBuf(out.clone()))));
@@ -1472,6 +1605,7 @@ mod tests {
             PtyListener {
                 writer,
                 colors: Arc::new(Mutex::new(TermColors::default())),
+                bell: Default::default(),
             },
         );
         let mut parser: Processor = Processor::new();
@@ -1610,6 +1744,7 @@ mod tests {
             PtyListener {
                 writer: Arc::new(Mutex::new(Box::new(std::io::sink()))),
                 colors: Arc::new(Mutex::new(TermColors::default())),
+                bell: Default::default(),
             },
         );
         let mut parser: Processor = Processor::new();
@@ -1642,6 +1777,7 @@ mod tests {
             PtyListener {
                 writer: Arc::new(Mutex::new(Box::new(std::io::sink()))),
                 colors: Arc::new(Mutex::new(TermColors::default())),
+                bell: Default::default(),
             },
         );
         let mut parser: Processor = Processor::new();

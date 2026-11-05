@@ -23,6 +23,7 @@ pub struct UiColors {
     pub accent: u32,
     pub error: u32,
     pub warning: u32,
+    pub success: u32,
 }
 
 impl Default for UiColors {
@@ -38,6 +39,7 @@ impl Default for UiColors {
             accent: 0x89b4fa,
             error: 0xf38ba8,
             warning: 0xf9e2af,
+            success: 0xa6e3a1,
         }
     }
 }
@@ -55,6 +57,7 @@ impl UiColors {
             "accent" => &mut self.accent,
             "error" => &mut self.error,
             "warning" => &mut self.warning,
+            "success" => &mut self.success,
             _ => return None,
         })
     }

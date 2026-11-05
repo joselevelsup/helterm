@@ -36,7 +36,8 @@ use_helix_theme = false
 # muted = "#7f849c"
 # accent = "#89b4fa"  # focus borders, headings
 # error = "#f38ba8"
-# warning = "#f9e2af"
+# warning = "#f9e2af"  # border of a container that needs you
+# success = "#a6e3a1"  # border of a container whose agent is done
 
 # What programs in the terminal see. (Helix draws with its own theme.)
 [colors.terminal]

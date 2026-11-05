@@ -229,7 +229,7 @@ fn colors(theme: &Table) -> Vec<Color> {
     let cyan = t.first("fg", &["type", "constant"]);
     let black = t.first("bg", &["ui.menu", "ui.statusline", "ui.cursorline.primary"]);
     let comment = t.first("fg", &["comment", "ui.linenr"]);
-    let slots: [(&'static str, &'static str, Option<u32>); 30] = [
+    let slots: [(&'static str, &'static str, Option<u32>); 31] = [
         ("ui", "background", background),
         ("ui", "panel", t.first("bg", &["ui.statusline", "ui.menu"])),
         ("ui", "sidebar", t.first("bg", &["ui.popup", "ui.menu"])),
@@ -240,6 +240,7 @@ fn colors(theme: &Table) -> Vec<Color> {
         ("ui", "accent", t.first("fg", &["function", "ui.text.focus"])),
         ("ui", "error", red),
         ("ui", "warning", yellow),
+        ("ui", "success", green),
         ("terminal", "foreground", text),
         ("terminal", "background", background),
         ("terminal", "cursor", t.first("bg", &["ui.cursor.primary", "ui.cursor"])),
