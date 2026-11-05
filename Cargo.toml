@@ -1,6 +1,6 @@
 [package]
 name = "helterm"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2021"
 description = "A Helix-centric project workspace manager: each workspace is a project folder with its editors, shells and tools arranged around it"
 repository = "https://github.com/joselevelsup/helterm"
