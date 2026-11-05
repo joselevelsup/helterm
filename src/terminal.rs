@@ -199,6 +199,10 @@ pub struct TerminalView {
     cell_size: Size<Pixels>,
     /// A mouse-drag selection is in progress.
     selecting: bool,
+    /// Button whose press went to the program, until its release does too.
+    mouse_button: Option<u32>,
+    /// Cell of the last mouse report, so motion is only reported per cell.
+    mouse_cell: Option<(usize, usize)>,
     /// Fraction of a line left over from smooth (touchpad) scrolling.
     scroll_remainder: f32,
     copy_mode: CopyModeState,
@@ -383,6 +387,42 @@ enum Wheel {
     Send(Vec<u8>),
 }
 
+/// Mouse report for a program that turned on mouse reporting: `button` is 0-2
+/// (left / middle / right), 3 (none), +32 for motion, 64/65 for the wheel, at
+/// viewport cell (`column`, `row`). Empty if the cell is too far for the encoding.
+fn mouse_report(mode: TermMode, button: u32, pressed: bool, column: usize, row: usize, mods: &gpui::Modifiers) -> Vec<u8> {
+    let button = button + 4 * mods.shift as u32 + 8 * mods.alt as u32 + 16 * mods.control as u32;
+    if mode.contains(TermMode::SGR_MOUSE) {
+        let end = if pressed { 'M' } else { 'm' };
+        return format!("\x1b[<{button};{};{}{end}", column + 1, row + 1).into_bytes();
+    }
+    // Legacy encoding can't say which button was released: releases are button 3.
+    let button = if pressed { button } else { 3 | (button & !3) };
+    // Each value offset by 32; UTF-8 mode widens the range.
+    let encode = |value: usize| -> Option<Vec<u8>> {
+        let value = 32 + 1 + value;
+        if mode.contains(TermMode::UTF8_MOUSE) {
+            char::from_u32(value as u32).map(|c| c.to_string().into_bytes())
+        } else {
+            u8::try_from(value).ok().map(|b| vec![b])
+        }
+    };
+    match (encode(column), encode(row)) {
+        (Some(col), Some(row)) => [b"\x1b[M".to_vec(), vec![32 + button as u8], col, row].concat(),
+        _ => vec![], // too far right/down for this encoding
+    }
+}
+
+/// Mouse button number in reports.
+fn button_code(button: MouseButton) -> Option<u32> {
+    match button {
+        MouseButton::Left => Some(0),
+        MouseButton::Middle => Some(1),
+        MouseButton::Right => Some(2),
+        _ => None,
+    }
+}
+
 /// Decide what `lines` wheel steps (positive = up) at viewport cell
 /// (`column`, `row`) mean for the program, like Alacritty does.
 fn wheel_input(mode: TermMode, lines: i32, column: usize, row: usize, mods: &gpui::Modifiers) -> Wheel {
@@ -392,27 +432,9 @@ fn wheel_input(mode: TermMode, lines: i32, column: usize, row: usize, mods: &gpu
     }
     if mode.intersects(TermMode::MOUSE_MODE) {
         // The program handles the mouse itself (Pi, Helix, htop...): report
-        // wheel buttons 64 (up) / 65 (down), with modifier bits.
-        let mut button = if lines > 0 { 64 } else { 65 };
-        button += 4 * mods.shift as u32 + 8 * mods.alt as u32 + 16 * mods.control as u32;
-        let report = if mode.contains(TermMode::SGR_MOUSE) {
-            format!("\x1b[<{button};{};{}M", column + 1, row + 1).into_bytes()
-        } else {
-            // Legacy encoding: each value offset by 32; UTF-8 mode widens the range.
-            let encode = |value: usize| -> Option<Vec<u8>> {
-                let value = 32 + 1 + value;
-                if mode.contains(TermMode::UTF8_MOUSE) {
-                    char::from_u32(value as u32).map(|c| c.to_string().into_bytes())
-                } else {
-                    u8::try_from(value).ok().map(|b| vec![b])
-                }
-            };
-            match (encode(column), encode(row)) {
-                (Some(col), Some(row)) => [b"\x1b[M".to_vec(), vec![32 + button as u8], col, row].concat(),
-                _ => return Wheel::Send(vec![]), // too far right/down for this encoding
-            }
-        };
-        return Wheel::Send(report.repeat(steps));
+        // wheel buttons 64 (up) / 65 (down).
+        let button = if lines > 0 { 64 } else { 65 };
+        return Wheel::Send(mouse_report(mode, button, true, column, row, mods).repeat(steps));
     }
     if mode.contains(TermMode::ALT_SCREEN) {
         // Full screen without mouse support (less, man): arrow keys, if allowed.
@@ -504,6 +526,8 @@ impl TerminalView {
             grid_origin: gpui::Point::default(),
             cell_size: Size::default(),
             selecting: false,
+            mouse_button: None,
+            mouse_cell: None,
             scroll_remainder: 0.,
             copy_mode: CopyModeState::default(),
             zoom: 0.,
@@ -639,9 +663,45 @@ impl TerminalView {
         (GridPoint::new(line, Column(column)), side)
     }
 
-    /// Click starts a selection: 1 click by character, 2 by word, 3 by line.
+    /// Viewport cell under a position, for mouse reports.
+    fn viewport_cell(&self, position: gpui::Point<Pixels>) -> (usize, usize) {
+        let (point, _) = self.grid_point(position);
+        let row = (point.line.0 + self.term.grid().display_offset() as i32).max(0) as usize;
+        (point.column.0, row)
+    }
+
+    /// The program handles the mouse itself; Shift selects text anyway, like Alacritty.
+    fn program_wants_mouse(&self, mods: &gpui::Modifiers) -> bool {
+        let mode = self.term.mode();
+        mode.intersects(TermMode::MOUSE_MODE) && !mode.contains(TermMode::VI) && !mods.shift
+    }
+
+    fn report_mouse(&mut self, button: u32, pressed: bool, position: gpui::Point<Pixels>, mods: &gpui::Modifiers) {
+        let (column, row) = self.viewport_cell(position);
+        self.mouse_cell = Some((column, row));
+        self.write(&mouse_report(*self.term.mode(), button, pressed, column, row, mods));
+    }
+
+    /// A click goes to the program if it handles the mouse. Otherwise left
+    /// starts a selection (1 click by character, 2 by word, 3 by line) and
+    /// middle pastes the primary selection.
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.focus_handle.focus(window);
+        if let Some(code) = button_code(event.button).filter(|_| self.program_wants_mouse(&event.modifiers)) {
+            self.mouse_button = Some(code);
+            self.report_mouse(code, true, event.position, &event.modifiers);
+            return;
+        }
+        match event.button {
+            MouseButton::Left => {}
+            MouseButton::Middle => {
+                if let Some(text) = cx.read_from_primary().and_then(|item| item.text()) {
+                    self.paste_text(&text, cx);
+                }
+                return;
+            }
+            _ => return,
+        }
         let (point, side) = self.grid_point(event.position);
         let ty = match event.click_count {
             2 => SelectionType::Semantic,
@@ -654,6 +714,18 @@ impl TerminalView {
     }
 
     fn mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.selecting && (self.mouse_button.is_some() || self.program_wants_mouse(&event.modifiers)) {
+            let mode = *self.term.mode();
+            let button = match self.mouse_button {
+                Some(button) if mode.intersects(TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION) => button,
+                None if mode.contains(TermMode::MOUSE_MOTION) => 3,
+                _ => return,
+            };
+            if self.mouse_cell != Some(self.viewport_cell(event.position)) {
+                self.report_mouse(button + 32, true, event.position, &event.modifiers);
+            }
+            return;
+        }
         if !self.selecting || event.pressed_button != Some(MouseButton::Left) {
             return;
         }
@@ -664,8 +736,14 @@ impl TerminalView {
         }
     }
 
-    fn mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if !std::mem::take(&mut self.selecting) {
+    fn mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let code = button_code(event.button);
+        if code.is_some() && code == self.mouse_button {
+            self.mouse_button = None;
+            self.report_mouse(code.unwrap(), false, event.position, &event.modifiers);
+            return;
+        }
+        if event.button != MouseButton::Left || !std::mem::take(&mut self.selecting) {
             return;
         }
         // Linux convention: selecting copies to the PRIMARY selection (middle-click paste).
@@ -727,9 +805,8 @@ impl TerminalView {
         if lines == 0 {
             return;
         }
-        let (point, _) = self.grid_point(event.position);
-        let row = (point.line.0 + self.term.grid().display_offset() as i32).max(0) as usize;
-        match wheel_input(*self.term.mode(), lines, point.column.0, row, &event.modifiers) {
+        let (column, row) = self.viewport_cell(event.position);
+        match wheel_input(*self.term.mode(), lines, column, row, &event.modifiers) {
             Wheel::ScrollHistory => {
                 self.term.scroll_display(Scroll::Delta(lines));
                 cx.notify();
@@ -751,13 +828,6 @@ impl TerminalView {
 
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            self.paste_text(&text, cx);
-        }
-    }
-
-    fn paste_primary(&mut self, _: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        self.focus_handle.focus(window);
-        if let Some(text) = cx.read_from_primary().and_then(|item| item.text()) {
             self.paste_text(&text, cx);
         }
     }
@@ -1286,11 +1356,14 @@ impl Render for TerminalView {
             .size_full()
             .key_context("Terminal")
             .track_focus(&self.focus_handle)
-            .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
+            .map(|el| {
+                [MouseButton::Left, MouseButton::Middle, MouseButton::Right].into_iter().fold(el, |el, button| {
+                    el.on_mouse_down(button, cx.listener(Self::mouse_down))
+                        .on_mouse_up(button, cx.listener(Self::mouse_up))
+                        .on_mouse_up_out(button, cx.listener(Self::mouse_up))
+                })
+            })
             .on_mouse_move(cx.listener(Self::mouse_move))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
-            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
-            .on_mouse_down(MouseButton::Middle, cx.listener(Self::paste_primary))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::toggle_copy_mode))
@@ -1493,6 +1566,25 @@ mod tests {
         assert_eq!(wheel_input(utf8, 1, 300, 4, &none), Wheel::Send("\x1b[M`ō%".as_bytes().to_vec()));
         // Copy mode always scrolls our view.
         assert_eq!(wheel_input(with_mouse | TermMode::VI, 1, 0, 0, &none), Wheel::ScrollHistory);
+    }
+
+    #[test]
+    fn clicks_are_reported_in_the_programs_encoding() {
+        let none = gpui::Modifiers::default();
+        let sgr = TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE;
+        // SGR: press M, release m, same button, 1-based cell.
+        assert_eq!(mouse_report(sgr, 0, true, 9, 4, &none), b"\x1b[<0;10;5M");
+        assert_eq!(mouse_report(sgr, 2, false, 9, 4, &none), b"\x1b[<2;10;5m");
+        // Drag with the left button, with Ctrl.
+        let ctrl = gpui::Modifiers { control: true, ..Default::default() };
+        assert_eq!(mouse_report(sgr, 32, true, 0, 0, &ctrl), b"\x1b[<48;1;1M");
+        // Legacy: releases are button 3, modifiers kept.
+        let legacy = TermMode::MOUSE_REPORT_CLICK;
+        assert_eq!(mouse_report(legacy, 0, true, 9, 4, &none), vec![0x1b, b'[', b'M', 32, 42, 37]);
+        assert_eq!(mouse_report(legacy, 1, false, 9, 4, &ctrl), vec![0x1b, b'[', b'M', 32 + 19, 42, 37]);
+        // Motion with no button: 3 + 32.
+        assert_eq!(mouse_report(legacy, 35, true, 0, 0, &none), vec![0x1b, b'[', b'M', 67, 33, 33]);
+        assert!(mouse_report(legacy, 0, true, 300, 0, &none).is_empty()); // too wide
     }
 
     #[test]
