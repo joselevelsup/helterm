@@ -721,7 +721,7 @@ impl TerminalView {
 
     fn feed(&mut self, bytes: &[u8]) {
         for b in bytes {
-            self.parser.advance(&mut self.term, *b);
+            self.parser.advance(&mut self.term, &[*b]);
             // Answered in stream order: Helix expects this before its DA1 reply.
             match self.theme_seqs.push(*b) {
                 Some(ThemeSeq::Query) => self.report_theme(),
@@ -1599,10 +1599,10 @@ mod tests {
         );
         let mut parser: Processor = Processor::new();
         for b in b"\x1b]0;title\x07done" {
-            parser.advance(&mut term, *b);
+            parser.advance(&mut term, &[*b]);
         }
         assert!(!bell.load(Ordering::Relaxed));
-        parser.advance(&mut term, 0x07);
+        parser.advance(&mut term, &[0x07]);
         assert!(bell.load(Ordering::Relaxed));
     }
 
@@ -1620,7 +1620,7 @@ mod tests {
         );
         let mut parser: Processor = Processor::new();
         for b in input {
-            parser.advance(&mut term, *b);
+            parser.advance(&mut term, &[*b]);
         }
         let bytes = out.lock().unwrap().clone();
         String::from_utf8(bytes).unwrap()
@@ -1759,7 +1759,7 @@ mod tests {
         );
         let mut parser: Processor = Processor::new();
         for b in b"hello world\r\nsecond line" {
-            parser.advance(&mut term, *b);
+            parser.advance(&mut term, &[*b]);
         }
         let at = |line, col| GridPoint::new(Line(line), Column(col));
 
@@ -1793,7 +1793,7 @@ mod tests {
         let mut parser: Processor = Processor::new();
         let text: String = (0..lines).map(|i| format!("line {i}\r\n")).collect();
         for b in text.as_bytes() {
-            parser.advance(&mut term, *b);
+            parser.advance(&mut term, &[*b]);
         }
         term
     }
@@ -1880,7 +1880,7 @@ mod tests {
         let mut term = term_with_lines(0);
         let mut parser: Processor = Processor::new();
         for b in b"\x1b[?1h" {
-            parser.advance(&mut term, *b);
+            parser.advance(&mut term, &[*b]);
         }
         assert!(term.mode().contains(TermMode::APP_CURSOR));
     }

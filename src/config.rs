@@ -113,8 +113,8 @@ impl TermColors {
 
 /// Every rebindable action: config name, default key, constructor.
 const ACTIONS: &[(&str, &str, fn() -> Box<dyn Action>)] = &[
-    ("split_right", "alt-enter", || Box::new(SplitRight)),
-    ("split_down", "alt-shift-enter", || Box::new(SplitDown)),
+    ("new_terminal", "alt-enter", || Box::new(NewTerminal)),
+    ("split_side", "alt-shift-enter", || Box::new(SplitSide)),
     ("new_editor", "alt-o", || Box::new(NewEditor)),
     ("new_agent", "alt-a", || Box::new(NewAgent)),
     ("close_container", "alt-q", || Box::new(CloseContainer)),
@@ -435,6 +435,12 @@ impl Config {
 
         let mut explicit = std::collections::HashSet::new();
         for (name, keys) in file.keybindings {
+            // Names from before the main-stack layout, still in generated configs.
+            let name = match name.as_str() {
+                "split_right" => "new_terminal".to_owned(),
+                "split_down" => "split_side".to_owned(),
+                _ => name,
+            };
             let Some((action, _, _)) = ACTIONS.iter().find(|(n, _, _)| *n == name) else {
                 config.warnings.push(format!("unknown action keybindings.{name}"));
                 continue;
@@ -604,7 +610,7 @@ mod tests {
             [keybindings]
             new_tab = ["alt-t", "ctrl-shift-t"]
             toggle_floating = ""
-            split_right = "ctrl-k ctrl-l"
+            new_terminal = "ctrl-k ctrl-l"
             "##,
         );
         assert!(config.warnings.is_empty(), "{:?}", config.warnings);
@@ -619,7 +625,7 @@ mod tests {
         assert_eq!(config.keys["new_tab"], vec!["alt-t", "ctrl-shift-t"]);
         assert!(config.keys["toggle_floating"].is_empty());
         assert_eq!(config.keys["close_container"], vec!["alt-q"]);
-        assert_eq!(config.key_label("split_right").as_deref(), Some("Ctrl+K Ctrl+L"));
+        assert_eq!(config.key_label("new_terminal").as_deref(), Some("Ctrl+K Ctrl+L"));
         assert_eq!(config.key_label("toggle_floating"), None);
     }
 
@@ -720,19 +726,19 @@ mod tests {
     #[test]
     fn duplicate_keys_are_flagged() {
         // Yours beats a default: new_tab loses its default alt-t.
-        let config = Config::parse("[keybindings]\nsplit_right = \"alt-t\"");
+        let config = Config::parse("[keybindings]\nnew_terminal = \"alt-t\"");
         assert_eq!(config.warnings.len(), 1, "{:?}", config.warnings);
-        assert!(config.warnings[0].contains("split_right keeps it"));
-        assert_eq!(config.keys["split_right"], vec!["alt-t"]);
+        assert!(config.warnings[0].contains("new_terminal keeps it"));
+        assert_eq!(config.keys["new_terminal"], vec!["alt-t"]);
         assert!(config.keys["new_tab"].is_empty());
 
         // Two of yours: the earlier action in the list wins, whatever the file order.
         // Different spellings of the same key still count as duplicates.
         let config = Config::parse(
-            "[keybindings]\nnew_tab = \"shift-alt-x\"\nsplit_down = \"alt-shift-x\"",
+            "[keybindings]\nnew_tab = \"shift-alt-x\"\nsplit_side = \"alt-shift-x\"",
         );
         assert_eq!(config.warnings.len(), 1, "{:?}", config.warnings);
-        assert_eq!(config.keys["split_down"], vec!["alt-shift-x"]);
+        assert_eq!(config.keys["split_side"], vec!["alt-shift-x"]);
         assert!(config.keys["new_tab"].is_empty());
 
         // Repeating a key for the same action is harmless, not a conflict.
@@ -743,18 +749,26 @@ mod tests {
     }
 
     #[test]
+    fn old_split_key_names_still_work() {
+        let config = Config::parse("[keybindings]\nsplit_right = \"alt-enter\"\nsplit_down = \"alt-x\"");
+        assert!(config.warnings.is_empty(), "{:?}", config.warnings);
+        assert_eq!(config.keys["new_terminal"], vec!["alt-enter"]);
+        assert_eq!(config.keys["split_side"], vec!["alt-x"]);
+    }
+
+    #[test]
     fn floating_commands_parse_validate_and_take_keys() {
         let config = Config::parse(
             r##"
             [keybindings]
-            split_right = "alt-s"
+            new_terminal = "alt-s"
 
             [[floating_commands]]
             key = "alt-g"
             command = "lazygit"
 
             [[floating_commands]]
-            key = ["alt-y", "alt-s"] # alt-s is already split_right's
+            key = ["alt-y", "alt-s"] # alt-s is already new_terminal's
             command = "htop -d 10"
 
             [[floating_commands]]
@@ -770,7 +784,7 @@ mod tests {
         );
         // alt-s clash, bad key name, missing command, missing key.
         assert_eq!(config.warnings.len(), 4, "{:?}", config.warnings);
-        assert!(config.warnings.iter().any(|w| w.contains("split_right keeps it")));
+        assert!(config.warnings.iter().any(|w| w.contains("new_terminal keeps it")));
         let commands: Vec<_> = config.floating_commands.iter().map(|f| (f.command.as_str(), f.keys.clone())).collect();
         assert_eq!(
             commands,

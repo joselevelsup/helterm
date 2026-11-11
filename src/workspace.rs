@@ -8,15 +8,15 @@ use gpui::{
 };
 
 use crate::config::{Config, UiColors, ui};
-use crate::container::{Axis, FocusDir, Node, Placement};
+use crate::container::{FocusDir, Layout, Placement};
 use crate::explorer::FileExplorer;
 use crate::terminal::{Attention, AttentionChanged, Exited, TerminalKind, TerminalView};
 
 actions!(
     workspace,
     [
-        SplitRight,
-        SplitDown,
+        NewTerminal,
+        SplitSide,
         NewEditor,
         NewAgent,
         CloseContainer,
@@ -50,17 +50,17 @@ pub struct RunFloatingCommand {
 struct Tab {
     /// Stable label; positions change when tabs are moved.
     number: usize,
-    /// Split tree of containers; `None` for an empty tab waiting for the user
-    /// to pick a terminal or an editor.
-    root: Option<Node<Entity<TerminalView>>>,
+    /// Main-stack layout of containers; `None` for an empty tab waiting for the
+    /// user to pick a terminal or an editor.
+    root: Option<Layout<Entity<TerminalView>>>,
     /// File explorers are attached to editor containers only.
     explorers: HashMap<EntityId, Entity<FileExplorer>>,
     /// Container to refocus when this tab becomes active again.
     last_focus: Option<EntityId>,
-    /// Container filling the whole tab; the split tree underneath is untouched,
+    /// Container filling the whole tab; the layout underneath is untouched,
     /// so un-maximizing restores the original layout.
     maximized: Option<EntityId>,
-    /// Terminals floating over the tab, outside the split tree: at most one per
+    /// Terminals floating over the tab, outside the layout: at most one per
     /// slot, and at most one visible.
     floats: Vec<Floating>,
 }
@@ -106,7 +106,7 @@ struct Floating {
     terminal: Entity<TerminalView>,
     slot: FloatSlot,
     visible: bool,
-    /// Its spot in the split tree, if it was floated out of it.
+    /// Its spot in the layout, if it was floated out of it.
     home: Option<Placement>,
 }
 
@@ -197,7 +197,7 @@ pub struct Workspace {
     save_tx: Option<async_channel::Sender<Saved>>,
 }
 
-/// How much one resize key press grows / shrinks a pane (share of its split).
+/// How much one resize key press moves an edge (share of the width / height).
 const RESIZE_STEP: f32 = 0.05;
 
 /// Space around and between panes (outer padding).
@@ -243,7 +243,7 @@ struct SavedTab {
     #[serde(default)]
     focus: usize,
     /// `None`: an empty tab.
-    layout: Option<Node<SavedPane>>,
+    layout: Option<Layout<SavedPane>>,
 }
 
 /// Only the layout: anything that isn't an editor or an agent comes back as a
@@ -1059,7 +1059,7 @@ impl Workspace {
             cx.notify();
             return;
         }
-        if matches!(tab.root, Some(Node::Leaf(_))) {
+        if tab.root.as_ref().is_some_and(|root| root.leaves().len() == 1) {
             if tab.floats.is_empty() {
                 self.close_tab(p, t, window, cx);
                 return;
@@ -1089,9 +1089,9 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Add a container next to the focused tiled one, or as the first one of an
-    /// empty tab.
-    fn add_container(&mut self, kind: TerminalKind, axis: Axis, window: &mut Window, cx: &mut Context<Self>) {
+    /// Add a container at the bottom of the stack (`side`: right of the focused
+    /// tiled one instead), or as the first one of an empty tab.
+    fn add_container(&mut self, kind: TerminalKind, side: bool, window: &mut Window, cx: &mut Context<Self>) {
         let anchor = self.focused_id(window, cx).filter(|id| self.is_tiled(*id));
         if self.tab().root.is_some() && anchor.is_none() {
             return; // e.g. the floating terminal is focused
@@ -1100,32 +1100,25 @@ impl Workspace {
         let tab = self.tab_mut();
         // The new container would be hidden behind a maximized one.
         tab.maximized = None;
-        match anchor {
-            Some(id) => {
-                if let Some(root) = tab.root.as_mut() {
-                    root.split_focused(id.as_u64(), axis, container.clone());
-                }
-            }
-            None => tab.root = Some(Node::Leaf(container.clone())),
+        match (tab.root.as_mut(), anchor) {
+            (Some(root), Some(id)) if side => root.split_side(id.as_u64(), container.clone()),
+            (Some(root), _) => root.push(container.clone()),
+            (None, _) => tab.root = Some(Layout::new(container.clone())),
         }
         container.read(cx).focus_handle(cx).focus(window);
         cx.notify();
     }
 
-    fn split(&mut self, axis: Axis, window: &mut Window, cx: &mut Context<Self>) {
-        self.add_container(TerminalKind::Terminal, axis, window, cx);
+    fn new_terminal_action(&mut self, _: &NewTerminal, window: &mut Window, cx: &mut Context<Self>) {
+        self.add_container(TerminalKind::Terminal, false, window, cx);
     }
 
-    fn split_right(&mut self, _: &SplitRight, window: &mut Window, cx: &mut Context<Self>) {
-        self.split(Axis::Row, window, cx);
-    }
-
-    fn split_down(&mut self, _: &SplitDown, window: &mut Window, cx: &mut Context<Self>) {
-        self.split(Axis::Col, window, cx);
+    fn split_side(&mut self, _: &SplitSide, window: &mut Window, cx: &mut Context<Self>) {
+        self.add_container(TerminalKind::Terminal, true, window, cx);
     }
 
     fn new_editor(&mut self, _: &NewEditor, window: &mut Window, cx: &mut Context<Self>) {
-        self.add_container(TerminalKind::Editor, Axis::Row, window, cx);
+        self.add_container(TerminalKind::Editor, false, window, cx);
     }
 
     fn new_agent(&mut self, _: &NewAgent, window: &mut Window, cx: &mut Context<Self>) {
@@ -1135,7 +1128,7 @@ impl Workspace {
     /// A container running `[agent] command`, or a warning if there is none.
     fn start_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match cx.global::<Config>().agent_command.clone() {
-            Some(command) => self.add_container(TerminalKind::Agent(command), Axis::Row, window, cx),
+            Some(command) => self.add_container(TerminalKind::Agent(command), false, window, cx),
             None => {
                 let warning = "no coding agent set: add [agent] command = \"opencode\" (or claude, codex, ...) to the config".to_owned();
                 if !self.state_warnings.contains(&warning) {
@@ -1234,6 +1227,11 @@ impl Workspace {
                 self.tab_mut().maximized = Some(selected);
                 self.exit_manage(window, cx);
             }
+            (ManageMode::Select, "p", _) => {
+                if let Some(root) = self.tab_mut().root.as_mut() {
+                    root.promote(selected.as_u64());
+                }
+            }
             (ManageMode::Move, _, Some(dir)) => {
                 // Swap with the neighbour on that side; the selection follows the
                 // pane (it's tracked by id), so it can keep moving.
@@ -1245,15 +1243,8 @@ impl Workspace {
                 }
             }
             (ManageMode::Resize, _, Some(dir)) => {
-                // Like dragging the pane's bottom-right corner.
-                let (axis, delta) = match dir {
-                    FocusDir::Right => (Axis::Row, RESIZE_STEP),
-                    FocusDir::Left => (Axis::Row, -RESIZE_STEP),
-                    FocusDir::Down => (Axis::Col, RESIZE_STEP),
-                    FocusDir::Up => (Axis::Col, -RESIZE_STEP),
-                };
                 if let Some(root) = self.tab_mut().root.as_mut() {
-                    root.resize(selected.as_u64(), axis, delta);
+                    root.resize(selected.as_u64(), dir, RESIZE_STEP);
                 }
             }
             (ManageMode::Select, _, Some(dir)) => {
@@ -1368,26 +1359,16 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Put a floating terminal back into the split tree: where it came from if
-    /// that spot still exists, else on the right edge.
+    /// Put a floating terminal back into the layout: where it came from if
+    /// that slot still exists, else at the bottom of the stack.
     fn dock_float(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let tab = self.tab_mut();
         let floating = tab.floats.remove(ix);
         let terminal = floating.terminal.clone();
-        let restored = match (tab.root.as_mut(), floating.home.as_ref()) {
-            (Some(root), Some(home)) => root.restore(home, terminal.clone()),
-            _ => false,
-        };
-        if !restored {
-            tab.root = Some(match tab.root.take() {
-                Some(old) => Node::Split {
-                    axis: Axis::Row,
-                    ratio: 0.5,
-                    first: Box::new(old),
-                    second: Box::new(Node::Leaf(terminal)),
-                },
-                None => Node::Leaf(terminal),
-            });
+        match (tab.root.as_mut(), floating.home.as_ref()) {
+            (Some(root), Some(home)) => root.restore(home, terminal),
+            (Some(root), None) => root.push(terminal),
+            (None, _) => tab.root = Some(Layout::new(terminal)),
         }
         // A maximized container would hide the one just docked.
         tab.maximized = None;
@@ -1814,8 +1795,8 @@ impl Workspace {
                         (None, _) => self.render_empty_tab(cx),
                         (Some(root), maximized) => {
                             match maximized.and_then(|id| root.find_leaf(id.as_u64())) {
-                                Some(leaf) => self.render_node(tab, &Node::Leaf(leaf.clone()), t, explorer_left),
-                                None => self.render_node(tab, root, t, explorer_left),
+                                Some(leaf) => self.render_pane(tab, leaf, t, explorer_left),
+                                None => self.render_layout(tab, root, t, explorer_left),
                             }
                         }
                     })
@@ -1835,7 +1816,7 @@ impl Workspace {
                                 .shadow_lg()
                                 // Clicks must not fall through to the tiles underneath.
                                 .occlude()
-                                .child(self.render_node(tab, &Node::Leaf(floating.terminal.clone()), t, explorer_left)),
+                                .child(self.render_pane(tab, &floating.terminal, t, explorer_left)),
                         )
                     })
                     .when_some(self.manage.as_ref(), |el, manage| el.child(manage_pill(manage.mode, t))),
@@ -1893,16 +1874,16 @@ impl Workspace {
                     .flex()
                     .gap_2()
                     .text_size(px(13.))
-                    .child(modal_button("start-terminal", with_key("Terminal", "split_right"), false, t).on_mouse_down(
+                    .child(modal_button("start-terminal", with_key("Terminal", "new_terminal"), false, t).on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                            this.add_container(TerminalKind::Terminal, Axis::Row, window, cx)
+                            this.add_container(TerminalKind::Terminal, false, window, cx)
                         }),
                     ))
                     .child(modal_button("start-editor", with_key("Editor", "new_editor"), false, t).on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                            this.add_container(TerminalKind::Editor, Axis::Row, window, cx)
+                            this.add_container(TerminalKind::Editor, false, window, cx)
                         }),
                     ))
                     .child(modal_button("start-agent", with_key("Agent", "new_agent"), false, t).on_mouse_down(
@@ -1912,53 +1893,56 @@ impl Workspace {
             )
     }
 
-    fn render_node(&self, tab: &Tab, node: &Node<Entity<TerminalView>>, t: UiColors, explorer_left: bool) -> Div {
-        match node {
-            Node::Leaf(terminal) => {
-                // Cached: a pane only redraws when it notifies (or on focus / theme
-                // changes, which refresh the whole window), not when a neighbour does.
-                let pane = AnyView::from(terminal.clone())
-                    .cached(StyleRefinement::default().flex_1().min_w_0().min_h_0());
-                // No gap: the explorer is joined to its editor's edge.
-                let mut el = div().relative().flex().flex_1().min_w_0().min_h_0().child(pane);
-                if explorer_left {
-                    el = el.flex_row_reverse();
-                }
-                if let Some(explorer) = tab.explorers.get(&terminal.entity_id()) {
-                    el = el.child(
-                        AnyView::from(explorer.clone())
-                            .cached(StyleRefinement::default().flex_none().w(px(crate::explorer::WIDTH))),
-                    );
-                }
-                let selected = self.manage.as_ref().is_some_and(|m| m.selected == terminal.entity_id());
-                if selected {
-                    // Light tint so the terminal underneath stays readable.
-                    let accent: Hsla = rgb(t.accent).into();
-                    el = el.child(
-                        div()
-                            .absolute()
-                            .top_0()
-                            .left_0()
-                            .size_full()
-                            .rounded_md()
-                            .bg(Hsla { a: 0.15, ..accent })
-                            .border_2()
-                            .border_color(accent),
-                    );
-                }
-                el
-            }
-            Node::Split { axis, ratio, first, second } => {
-                let mut el = div().flex_1().min_w_0().min_h_0().flex().gap(px(PANE_GAP));
-                el = match axis {
-                    Axis::Row => el.flex_row(),
-                    Axis::Col => el.flex_col(),
-                };
-                // Children split the space by the ratio (flex basis 0, grow by share).
-                el.child(grow(self.render_node(tab, first, t, explorer_left), *ratio))
-                    .child(grow(self.render_node(tab, second, t, explorer_left), 1. - *ratio))
-            }
+    fn render_pane(&self, tab: &Tab, terminal: &Entity<TerminalView>, t: UiColors, explorer_left: bool) -> Div {
+        // Cached: a pane only redraws when it notifies (or on focus / theme
+        // changes, which refresh the whole window), not when a neighbour does.
+        let pane = AnyView::from(terminal.clone()).cached(StyleRefinement::default().flex_1().min_w_0().min_h_0());
+        // No gap: the explorer is joined to its editor's edge.
+        let mut el = div().relative().flex().flex_1().min_w_0().min_h_0().child(pane);
+        if explorer_left {
+            el = el.flex_row_reverse();
         }
+        if let Some(explorer) = tab.explorers.get(&terminal.entity_id()) {
+            el = el.child(
+                AnyView::from(explorer.clone())
+                    .cached(StyleRefinement::default().flex_none().w(px(crate::explorer::WIDTH))),
+            );
+        }
+        let selected = self.manage.as_ref().is_some_and(|m| m.selected == terminal.entity_id());
+        if selected {
+            // Light tint so the terminal underneath stays readable.
+            let accent: Hsla = rgb(t.accent).into();
+            el = el.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .rounded_md()
+                    .bg(Hsla { a: 0.15, ..accent })
+                    .border_2()
+                    .border_color(accent),
+            );
+        }
+        el
+    }
+
+    /// Main on the left, the stack on the right; each slot a row of panes.
+    fn render_layout(&self, tab: &Tab, layout: &Layout<Entity<TerminalView>>, t: UiColors, explorer_left: bool) -> Div {
+        let box_ = || div().flex_1().min_w_0().min_h_0().flex().gap(px(PANE_GAP));
+        let row = |panes: &[Entity<TerminalView>]| {
+            box_().flex_row().children(panes.iter().map(|p| self.render_pane(tab, p, t, explorer_left)))
+        };
+        let (main, stack) = layout.slots.split_first().expect("layout is never empty");
+        if stack.is_empty() {
+            return row(&main.panes);
+        }
+        // Flex basis 0, grow by share: the children split the space by ratio / weight.
+        let stack = box_().flex_col().children(stack.iter().map(|slot| grow(row(&slot.panes), slot.weight)));
+        box_()
+            .flex_row()
+            .child(grow(row(&main.panes), layout.main_ratio))
+            .child(grow(stack, 1. - layout.main_ratio))
     }
 }
 
@@ -1997,8 +1981,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::next_workspace))
             .on_action(cx.listener(Self::prev_workspace))
             .when(!self.projects.is_empty(), |el| {
-                el.on_action(cx.listener(Self::split_right))
-                    .on_action(cx.listener(Self::split_down))
+                el.on_action(cx.listener(Self::new_terminal_action))
+                    .on_action(cx.listener(Self::split_side))
                     .on_action(cx.listener(Self::new_editor))
                     .on_action(cx.listener(Self::new_agent))
                     .on_action(cx.listener(Self::close_focused))
@@ -2046,8 +2030,8 @@ fn grow(mut el: Div, share: f32) -> Div {
 /// The pill showing which management mode is active and its keys.
 fn manage_pill(mode: ManageMode, t: UiColors) -> Div {
     let text = match mode {
-        ManageMode::Select => "MANAGE  ·  hjkl select  ·  r resize  ·  m move  ·  z zoom  ·  esc exit",
-        ManageMode::Resize => "RESIZE  ·  h/l width  ·  j/k height  ·  esc back",
+        ManageMode::Select => "MANAGE  ·  hjkl select  ·  p to main  ·  r resize  ·  m move  ·  z zoom  ·  esc exit",
+        ManageMode::Resize => "RESIZE  ·  h/l main width  ·  j/k stack height  ·  esc back",
         ManageMode::Move => "MOVE  ·  hjkl swap  ·  esc back",
     };
     div()
@@ -2129,11 +2113,11 @@ fn modal_button(id: &'static str, label: impl Into<SharedString>, primary: bool,
 #[cfg(test)]
 mod tests {
     use super::{Saved, SavedPane, SavedTab, SavedWorkspace, active_after_close, load_saved, next_dup, write_saved};
-    use crate::container::{Axis, Node};
+    use crate::container::{Layout, Slot};
     use std::path::PathBuf;
 
-    fn pane(editor: bool, explorer: bool) -> Node<SavedPane> {
-        Node::Leaf(SavedPane { editor, explorer, agent: false })
+    fn pane(editor: bool, explorer: bool) -> SavedPane {
+        SavedPane { editor, explorer, agent: false }
     }
 
     #[test]
@@ -2143,16 +2127,13 @@ mod tests {
         let path = dir.join("helterm").join("workspaces.toml");
 
         assert_eq!(load_saved(&path).unwrap(), Saved::default()); // first start
-        let layout = Node::Split {
-            axis: Axis::Row,
-            ratio: 0.65,
-            first: Box::new(pane(true, true)),
-            second: Box::new(Node::Split {
-                axis: Axis::Col,
-                ratio: 0.3,
-                first: Box::new(Node::Leaf(SavedPane { editor: false, explorer: false, agent: true })),
-                second: Box::new(pane(true, false)),
-            }),
+        let layout = Layout {
+            main_ratio: 0.65,
+            slots: vec![
+                Slot { panes: vec![pane(true, true), pane(false, false)], weight: 1. },
+                Slot { panes: vec![SavedPane { editor: false, explorer: false, agent: true }], weight: 0.3 },
+                Slot { panes: vec![pane(true, false)], weight: 1. },
+            ],
         };
         let saved = Saved {
             active: 1,

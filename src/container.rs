@@ -4,15 +4,6 @@ use gpui::Entity;
 
 use crate::terminal::TerminalView;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Axis {
-    /// Children side by side.
-    Row,
-    /// Children stacked.
-    Col,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FocusDir {
     Left,
@@ -21,7 +12,7 @@ pub enum FocusDir {
     Down,
 }
 
-/// Anything that can live as a leaf of the split tree.
+/// Anything that can live in the layout.
 pub trait Leaf: Clone {
     fn leaf_id(&self) -> u64;
 }
@@ -38,470 +29,344 @@ impl Leaf for u64 {
     }
 }
 
-/// A pane never gets smaller than this share of its split.
 const MIN_RATIO: f32 = 0.1;
 const MAX_RATIO: f32 = 1. - MIN_RATIO;
+const MIN_WEIGHT: f32 = 0.2;
+const MAX_WEIGHT: f32 = 5.;
 
-/// Sway-style binary split tree. A leaf is one terminal; splits nest freely.
+/// One row of the layout: panes side by side, evenly wide.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Node<L> {
-    Leaf(L),
-    Split {
-        axis: Axis,
-        /// Share of the space the first child gets (0.5 = even).
-        ratio: f32,
-        first: Box<Node<L>>,
-        second: Box<Node<L>>,
-    },
+pub struct Slot<L> {
+    pub panes: Vec<L>,
+    /// Height share within the stack (flex grow); unused for main.
+    pub weight: f32,
 }
 
-impl<L> Node<L> {
-    /// The same tree (shape and sizes) with every leaf turned into `f(leaf)`.
-    pub fn map<M>(&self, f: &mut impl FnMut(&L) -> M) -> Node<M> {
+impl<L> Slot<L> {
+    fn new(leaf: L) -> Self {
+        Slot { panes: vec![leaf], weight: 1. }
+    }
+}
+
+/// Main-stack layout: the main slot on the left, the other slots stacked on the
+/// right. Never empty: an empty tab has no layout at all.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(from = "SavedLayout<L>", bound(deserialize = "L: serde::Deserialize<'de>"))]
+pub struct Layout<L> {
+    /// Share of the width main gets while there is a stack.
+    pub main_ratio: f32,
+    /// `slots[0]` is main, the rest the stack from top to bottom.
+    pub slots: Vec<Slot<L>>,
+}
+
+/// What state files hold: this layout, or the split tree of older versions.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum SavedLayout<L> {
+    Layout { main_ratio: f32, slots: Vec<Slot<L>> },
+    Tree(Tree<L>),
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Tree<L> {
+    Leaf(L),
+    Split { first: Box<Tree<L>>, second: Box<Tree<L>> },
+}
+
+impl<L> Tree<L> {
+    fn into_leaves(self, out: &mut Vec<L>) {
         match self {
-            Node::Leaf(l) => Node::Leaf(f(l)),
-            Node::Split { axis, ratio, first, second } => Node::Split {
-                axis: *axis,
-                ratio: *ratio,
-                first: Box::new(first.map(f)),
-                second: Box::new(second.map(f)),
-            },
+            Tree::Leaf(l) => out.push(l),
+            Tree::Split { first, second } => {
+                first.into_leaves(out);
+                second.into_leaves(out);
+            }
         }
     }
 }
 
-impl<L: Leaf> Node<L> {
-    pub fn contains(&self, id: u64) -> bool {
-        match self {
-            Node::Leaf(l) => l.leaf_id() == id,
-            Node::Split { first, second, .. } => first.contains(id) || second.contains(id),
+impl<L> From<SavedLayout<L>> for Layout<L> {
+    fn from(saved: SavedLayout<L>) -> Self {
+        match saved {
+            SavedLayout::Layout { main_ratio, slots } => Layout { main_ratio, slots },
+            // Old split trees: the first pane becomes main, the rest the stack.
+            SavedLayout::Tree(tree) => {
+                let mut leaves = vec![];
+                tree.into_leaves(&mut leaves);
+                Layout { main_ratio: 0.5, slots: leaves.into_iter().map(Slot::new).collect() }
+            }
         }
+    }
+}
+
+impl<L> Layout<L> {
+    pub fn new(leaf: L) -> Self {
+        Layout { main_ratio: 0.5, slots: vec![Slot::new(leaf)] }
+    }
+
+    /// The same layout (shape and sizes) with every leaf turned into `f(leaf)`.
+    pub fn map<M>(&self, f: &mut impl FnMut(&L) -> M) -> Layout<M> {
+        Layout {
+            main_ratio: self.main_ratio,
+            slots: self
+                .slots
+                .iter()
+                .map(|s| Slot { panes: s.panes.iter().map(&mut *f).collect(), weight: s.weight })
+                .collect(),
+        }
+    }
+
+    /// All panes: main first, then the stack, each slot left to right.
+    pub fn leaves(&self) -> Vec<&L> {
+        self.slots.iter().flat_map(|s| &s.panes).collect()
     }
 
     pub fn first_leaf(&self) -> Option<&L> {
-        match self {
-            Node::Leaf(l) => Some(l),
-            Node::Split { first, .. } => first.first_leaf(),
-        }
+        self.slots.first().and_then(|s| s.panes.first())
     }
 
-    pub fn last_leaf(&self) -> Option<&L> {
-        match self {
-            Node::Leaf(l) => Some(l),
-            Node::Split { second, .. } => second.last_leaf(),
-        }
+    /// Add a slot at the bottom of the stack.
+    pub fn push(&mut self, leaf: L) {
+        self.slots.push(Slot::new(leaf));
+    }
+}
+
+impl<L: Leaf> Layout<L> {
+    /// Slot and position of leaf `id`.
+    fn locate(&self, id: u64) -> Option<(usize, usize)> {
+        self.slots.iter().enumerate().find_map(|(s, slot)| {
+            slot.panes.iter().position(|l| l.leaf_id() == id).map(|p| (s, p))
+        })
+    }
+
+    pub fn contains(&self, id: u64) -> bool {
+        self.locate(id).is_some()
     }
 
     pub fn find_leaf(&self, id: u64) -> Option<&L> {
-        match self {
-            Node::Leaf(l) if l.leaf_id() == id => Some(l),
-            Node::Leaf(_) => None,
-            Node::Split { first, second, .. } => {
-                first.find_leaf(id).or_else(|| second.find_leaf(id))
-            }
+        self.locate(id).map(|(s, p)| &self.slots[s].panes[p])
+    }
+
+    /// Put `leaf` right of leaf `id`, in the same slot.
+    pub fn split_side(&mut self, id: u64, leaf: L) {
+        if let Some((s, p)) = self.locate(id) {
+            self.slots[s].panes.insert(p + 1, leaf);
         }
     }
 
-    /// Replace the leaf with `id` by a split holding it and `new_leaf` along `axis`.
-    pub fn split_focused(&mut self, id: u64, axis: Axis, new_leaf: L) {
-        match self {
-            Node::Leaf(l) if l.leaf_id() == id => {
-                let old = self.clone();
-                *self = Node::Split {
-                    axis,
-                    ratio: 0.5,
-                    first: Box::new(old),
-                    second: Box::new(Node::Leaf(new_leaf)),
-                };
-            }
-            Node::Split { first, second, .. } => {
-                if first.contains(id) {
-                    first.split_focused(id, axis, new_leaf)
-                } else {
-                    second.split_focused(id, axis, new_leaf)
-                }
-            }
-            Node::Leaf(_) => {}
-        }
-    }
-
-    /// Remove the leaf with `id`. Returns false if this whole node was removed.
-    /// A split left with a single child collapses into that child.
+    /// Remove leaf `id`. Returns false if the layout is now empty. An empty slot
+    /// goes away; an empty main is replaced by the top of the stack.
     pub fn remove(&mut self, id: u64) -> bool {
-        match self {
-            Node::Leaf(l) => l.leaf_id() != id,
-            Node::Split { first, second, .. } => {
-                if first.contains(id) {
-                    if first.remove(id) {
-                        true
-                    } else {
-                        *self = (**second).clone();
-                        true
-                    }
-                } else if second.contains(id) {
-                    if second.remove(id) {
-                        true
-                    } else {
-                        *self = (**first).clone();
-                        true
-                    }
-                } else {
-                    false
-                }
+        if let Some((s, p)) = self.locate(id) {
+            self.slots[s].panes.remove(p);
+            if self.slots[s].panes.is_empty() {
+                self.slots.remove(s);
             }
         }
+        !self.slots.is_empty()
     }
 
-    /// Sway-style focus movement: walk up to the nearest ancestor split whose
-    /// axis matches the movement direction, then jump to a leaf of the sibling
-    /// on that side. Returns None when there is nothing to move to.
+    /// The pane next to leaf `id` in direction `dir`. Right of main is the top
+    /// of the stack, left of the stack is main.
     pub fn focus_dir(&self, id: u64, dir: FocusDir) -> Option<&L> {
-        match self {
-            Node::Leaf(_) => None,
-            Node::Split { axis, first, second, .. } => {
-                let horizontal = matches!(dir, FocusDir::Left | FocusDir::Right);
-                if (*axis == Axis::Row) == horizontal {
-                    if first.contains(id) {
-                        // A deeper split along the same axis wins over this one.
-                        first
-                            .focus_dir(id, dir)
-                            .or(match dir {
-                                FocusDir::Right | FocusDir::Down => second.first_leaf(),
-                                _ => None,
-                            })
-                    } else if second.contains(id) {
-                        second
-                            .focus_dir(id, dir)
-                            .or(match dir {
-                                FocusDir::Left | FocusDir::Up => first.last_leaf(),
-                                _ => None,
-                            })
-                    } else {
-                        None
-                    }
-                } else if first.contains(id) {
-                    first.focus_dir(id, dir)
-                } else {
-                    second.focus_dir(id, dir)
-                }
-            }
+        let (s, p) = self.locate(id)?;
+        let panes = &self.slots[s].panes;
+        // Same column if the neighbour slot is wide enough, else its last pane.
+        let at = |s: usize| self.slots.get(s).and_then(|slot| slot.panes.get(p.min(slot.panes.len() - 1)));
+        match dir {
+            FocusDir::Left if p > 0 => panes.get(p - 1),
+            FocusDir::Left if s > 0 => self.slots[0].panes.last(),
+            FocusDir::Right if p + 1 < panes.len() => panes.get(p + 1),
+            FocusDir::Right if s == 0 => self.slots.get(1).and_then(|slot| slot.panes.first()),
+            FocusDir::Up if s > 1 => at(s - 1),
+            FocusDir::Down if s > 0 => at(s + 1),
+            _ => None,
         }
     }
 
-    /// Grow (`delta` > 0) or shrink leaf `id` along `axis` (Row: width, Col:
-    /// height) by moving the nearest split above it that runs that way. False
-    /// if there is no such split, e.g. widening a pane that spans the width.
-    pub fn resize(&mut self, id: u64, axis: Axis, delta: f32) -> bool {
-        let Node::Split { axis: split_axis, ratio, first, second } = self else {
+    /// Left / right move the edge between main and the stack; down / up grow /
+    /// shrink the height of leaf `id`'s stack slot. False if nothing changed.
+    pub fn resize(&mut self, id: u64, dir: FocusDir, step: f32) -> bool {
+        let Some((s, _)) = self.locate(id) else {
             return false;
         };
-        let in_first = first.contains(id);
-        if !in_first && !second.contains(id) {
-            return false;
+        let stack = self.slots.len() - 1;
+        match dir {
+            FocusDir::Left | FocusDir::Right if stack > 0 => {
+                let step = if dir == FocusDir::Right { step } else { -step };
+                self.main_ratio = (self.main_ratio + step).clamp(MIN_RATIO, MAX_RATIO);
+                true
+            }
+            FocusDir::Up | FocusDir::Down if s > 0 && stack > 1 => {
+                // Weights are relative: scale so a step moves about `step` of the height.
+                let step = if dir == FocusDir::Down { step } else { -step } * stack as f32;
+                let weight = &mut self.slots[s].weight;
+                *weight = (*weight + step).clamp(MIN_WEIGHT, MAX_WEIGHT);
+                true
+            }
+            _ => false,
         }
-        let child = if in_first { first } else { second };
-        // The nearest split wins, so look deeper first.
-        if child.resize(id, axis, delta) {
-            return true;
-        }
-        if *split_axis != axis {
-            return false;
-        }
-        // The first child's share grows when it's the one growing.
-        let delta = if in_first { delta } else { -delta };
-        *ratio = (*ratio + delta).clamp(MIN_RATIO, MAX_RATIO);
-        true
     }
 
-    /// Swap leaves `a` and `b`. The split sizes stay with the positions. False
-    /// unless both exist and differ.
+    /// Swap leaves `a` and `b`; sizes stay with the positions. False unless
+    /// both exist and differ.
     pub fn swap(&mut self, a: u64, b: u64) -> bool {
-        let (Some(leaf_a), Some(leaf_b)) = (self.find_leaf(a).cloned(), self.find_leaf(b).cloned()) else {
+        let (Some((sa, pa)), Some((sb, pb))) = (self.locate(a), self.locate(b)) else {
             return false;
         };
         if a == b {
             return false;
         }
-        // One pass, so the tree never holds two copies of the same leaf.
-        fn exchange<L: Leaf>(node: &mut Node<L>, a: u64, b: u64, leaf_a: &L, leaf_b: &L) {
-            match node {
-                Node::Leaf(l) if l.leaf_id() == a => *l = leaf_b.clone(),
-                Node::Leaf(l) if l.leaf_id() == b => *l = leaf_a.clone(),
-                Node::Leaf(_) => {}
-                Node::Split { first, second, .. } => {
-                    exchange(first, a, b, leaf_a, leaf_b);
-                    exchange(second, a, b, leaf_a, leaf_b);
-                }
-            }
-        }
-        exchange(self, a, b, &leaf_a, &leaf_b);
+        let leaf_a = self.slots[sa].panes[pa].clone();
+        self.slots[sa].panes[pa] = std::mem::replace(&mut self.slots[sb].panes[pb], leaf_a);
         true
     }
 
-    pub fn leaves(&self) -> Vec<&L> {
-        match self {
-            Node::Leaf(l) => vec![l],
-            Node::Split { first, second, .. } => {
-                let mut out = first.leaves();
-                out.extend(second.leaves());
-                out
+    /// Swap leaf `id`'s slot with main. False if it already is main.
+    pub fn promote(&mut self, id: u64) -> bool {
+        match self.locate(id) {
+            Some((s, _)) if s > 0 => {
+                let (main, stack) = self.slots.split_at_mut(1);
+                std::mem::swap(&mut main[0].panes, &mut stack[s - 1].panes);
+                true
             }
+            _ => false,
         }
     }
 
-    fn sorted_ids(&self) -> Vec<u64> {
-        let mut ids: Vec<u64> = self.leaves().iter().map(|l| l.leaf_id()).collect();
-        ids.sort_unstable();
-        ids
-    }
-
-    /// Where leaf `id` sits: its parent's axis, its side, and its sibling subtree.
+    /// Where leaf `id` sits, so it can be put back after floating.
     pub fn placement(&self, id: u64) -> Option<Placement> {
-        let Node::Split { axis, ratio, first, second } = self else {
-            return None;
-        };
-        let is_leaf = |n: &Node<L>| matches!(n, Node::Leaf(l) if l.leaf_id() == id);
-        let (axis, ratio) = (*axis, *ratio);
-        if is_leaf(first) {
-            return Some(Placement { axis, ratio, first: true, sibling: second.sorted_ids() });
-        }
-        if is_leaf(second) {
-            return Some(Placement { axis, ratio, first: false, sibling: first.sorted_ids() });
-        }
-        first.placement(id).or_else(|| second.placement(id))
+        let (slot, pos) = self.locate(id)?;
+        let alone = self.slots[slot].panes.len() == 1;
+        Some(Placement { slot, pos, own_slot: alone.then_some(self.slots[slot].weight) })
     }
 
-    /// Put `leaf` back where `placement` says it was. False if its sibling
-    /// subtree no longer exists in this exact shape.
-    pub fn restore(&mut self, placement: &Placement, leaf: L) -> bool {
-        if self.sorted_ids() == placement.sibling {
-            let old = Box::new(self.clone());
-            let new = Box::new(Node::Leaf(leaf));
-            let (first, second) = if placement.first { (new, old) } else { (old, new) };
-            *self = Node::Split { axis: placement.axis, ratio: placement.ratio, first, second };
-            return true;
-        }
-        match self {
-            Node::Leaf(_) => false,
-            Node::Split { first, second, .. } => {
-                first.restore(placement, leaf.clone()) || second.restore(placement, leaf)
+    /// Put `leaf` back where `placement` says it was, or at the bottom of the
+    /// stack if that slot is gone.
+    pub fn restore(&mut self, placement: &Placement, leaf: L) {
+        match placement.own_slot {
+            Some(weight) => {
+                let at = placement.slot.min(self.slots.len());
+                self.slots.insert(at, Slot { panes: vec![leaf], weight });
             }
+            None => match self.slots.get_mut(placement.slot) {
+                Some(slot) => slot.panes.insert(placement.pos.min(slot.panes.len()), leaf),
+                None => self.push(leaf),
+            },
         }
     }
 }
 
-/// A leaf's spot in the tree, recorded so it can be put back after floating.
+/// A leaf's spot in the layout, recorded so it can be put back after floating.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Placement {
-    axis: Axis,
-    /// The split's size, so putting the leaf back restores it too.
-    ratio: f32,
-    /// Whether the leaf was the first (left/top) child.
-    first: bool,
-    /// Sorted leaf ids of the sibling subtree it was split from.
-    sibling: Vec<u64>,
+    slot: usize,
+    pos: usize,
+    /// It had the slot to itself (with this weight), so it gets one back.
+    own_slot: Option<f32>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn ids(layout: &Layout<u64>) -> Vec<Vec<u64>> {
+        layout.slots.iter().map(|s| s.panes.clone()).collect()
+    }
+
+    /// Main [1 | 4], stack [2], [3].
+    fn sample() -> Layout<u64> {
+        let mut layout = Layout::new(1);
+        layout.push(2);
+        layout.push(3);
+        layout.split_side(1, 4);
+        layout
+    }
+
+    #[test]
+    fn push_stacks_and_split_side_goes_next_to_it() {
+        let layout = sample();
+        assert_eq!(ids(&layout), vec![vec![1, 4], vec![2], vec![3]]);
+        let leaves: Vec<u64> = layout.leaves().into_iter().copied().collect();
+        assert_eq!(leaves, vec![1, 4, 2, 3]);
+    }
+
+    #[test]
+    fn removing_main_promotes_the_top_of_the_stack() {
+        let mut layout = sample();
+        assert!(layout.remove(4));
+        assert!(layout.remove(1));
+        assert_eq!(ids(&layout), vec![vec![2], vec![3]]);
+        assert!(layout.remove(9)); // not there: untouched
+        assert!(layout.remove(2));
+        assert!(!layout.remove(3));
+    }
+
+    #[test]
+    fn focus_moves_between_main_and_stack() {
+        let layout = sample();
+        let go = |id, dir| layout.focus_dir(id, dir).copied();
+        assert_eq!(go(1, FocusDir::Right), Some(4));
+        assert_eq!(go(4, FocusDir::Right), Some(2));
+        assert_eq!(go(2, FocusDir::Left), Some(4));
+        assert_eq!(go(2, FocusDir::Down), Some(3));
+        assert_eq!(go(3, FocusDir::Up), Some(2));
+        assert_eq!(go(2, FocusDir::Up), None);
+        assert_eq!(go(1, FocusDir::Down), None);
+        assert_eq!(go(1, FocusDir::Left), None);
+        assert_eq!(go(3, FocusDir::Right), None);
+    }
+
+    #[test]
+    fn resize_moves_the_main_edge_and_stack_heights() {
+        let mut layout = sample();
+        assert!(layout.resize(2, FocusDir::Right, 0.05));
+        assert!((layout.main_ratio - 0.55).abs() < 1e-4);
+        for _ in 0..20 {
+            layout.resize(1, FocusDir::Left, 0.05);
+        }
+        assert!((layout.main_ratio - MIN_RATIO).abs() < 1e-4);
+        assert!(layout.resize(3, FocusDir::Down, 0.05));
+        assert!(layout.slots[2].weight > 1.);
+        assert!(!layout.resize(1, FocusDir::Down, 0.05)); // main has no height to change
+        assert!(!Layout::new(1u64).resize(1, FocusDir::Right, 0.05)); // no stack
+    }
+
+    #[test]
+    fn swap_and_promote() {
+        let mut layout = sample();
+        assert!(layout.swap(4, 3));
+        assert_eq!(ids(&layout), vec![vec![1, 3], vec![2], vec![4]]);
+        assert!(!layout.swap(1, 1));
+        assert!(!layout.swap(1, 9));
+        assert!(layout.promote(2));
+        assert_eq!(ids(&layout), vec![vec![2], vec![1, 3], vec![4]]);
+        assert!(!layout.promote(2));
+    }
+
     #[test]
     fn float_and_restore_round_trips_exactly() {
-        // Row{ Col{1, 3}, 2 }: 3 is the bottom of the left column.
-        let mut tree = Node::Leaf(1u64);
-        tree.split_focused(1, Axis::Row, 2);
-        tree.split_focused(1, Axis::Col, 3);
-        let original = tree.clone();
-
-        for id in [1, 2, 3] {
-            let placement = tree.placement(id).unwrap();
-            tree.remove(id);
-            assert!(!tree.contains(id));
-            assert!(tree.restore(&placement, id));
-            assert_eq!(tree, original, "leaf {id}");
+        let mut layout = sample();
+        layout.resize(3, FocusDir::Down, 0.1);
+        let original = layout.clone();
+        for id in [1, 2, 3, 4] {
+            let placement = layout.placement(id).unwrap();
+            layout.remove(id);
+            assert!(!layout.contains(id));
+            layout.restore(&placement, id);
+            assert_eq!(layout, original, "leaf {id}");
         }
     }
 
     #[test]
-    fn restore_fails_when_the_sibling_changed() {
-        let mut tree = Node::Leaf(1u64);
-        tree.split_focused(1, Axis::Row, 2);
-        let placement = tree.placement(2).unwrap();
-        tree.remove(2);
-        tree.split_focused(1, Axis::Col, 4);
-        tree.remove(1); // 2's sibling is gone entirely
-        assert!(!tree.restore(&placement, 2));
-        assert!(Node::Leaf(1u64).placement(1).is_none());
-    }
-
-    fn ratio_of(node: &Node<u64>) -> f32 {
-        match node {
-            Node::Split { ratio, .. } => *ratio,
-            Node::Leaf(_) => panic!("not a split"),
-        }
-    }
-
-    fn close(a: f32, b: f32) -> bool {
-        (a - b).abs() < 1e-4
-    }
-
-    #[test]
-    fn resize_grows_the_selected_pane_and_clamps() {
-        // [1 | 2]
-        let mut tree = Node::Leaf(1u64);
-        tree.split_focused(1, Axis::Row, 2);
-        assert!(tree.resize(1, Axis::Row, 0.05));
-        assert!(close(ratio_of(&tree), 0.55)); // 1 (left) grew
-        assert!(tree.resize(2, Axis::Row, 0.05));
-        assert!(close(ratio_of(&tree), 0.5)); // 2 (right) grew back
-        for _ in 0..20 {
-            tree.resize(1, Axis::Row, 0.05);
-        }
-        assert!(close(ratio_of(&tree), MAX_RATIO));
-        // No stacked split: can't change the height.
-        assert!(!tree.resize(1, Axis::Col, 0.05));
-        assert!(!tree.resize(9, Axis::Row, 0.05)); // unknown leaf
-    }
-
-    #[test]
-    fn resize_moves_the_nearest_split_on_that_axis() {
-        // Row{ Col{1, 3}, 2 }: 3 is below 1 in the left column.
-        let mut tree = Node::Leaf(1u64);
-        tree.split_focused(1, Axis::Row, 2);
-        tree.split_focused(1, Axis::Col, 3);
-        let Node::Split { first: left, .. } = &tree else { unreachable!() };
-        assert!(close(ratio_of(left), 0.5));
-
-        // Width of 3: only the outer Row split can do that.
-        assert!(tree.resize(3, Axis::Row, 0.05));
-        assert!(close(ratio_of(&tree), 0.55));
-        // Height of 3 (bottom half of the column): the inner split's top share shrinks.
-        assert!(tree.resize(3, Axis::Col, 0.05));
-        let Node::Split { first: left, .. } = &tree else { unreachable!() };
-        assert!(close(ratio_of(left), 0.45));
-        assert!(close(ratio_of(&tree), 0.55)); // outer untouched
-
-        // [1 | [2 | 3]]: widening 3 moves the inner split, not the outer one.
-        let mut tree = Node::Leaf(1u64);
-        tree.split_focused(1, Axis::Row, 2);
-        tree.split_focused(2, Axis::Row, 3);
-        assert!(tree.resize(3, Axis::Row, 0.05));
-        assert!(close(ratio_of(&tree), 0.5));
-        let Node::Split { second: right, .. } = &tree else { unreachable!() };
-        assert!(close(ratio_of(right), 0.45));
-    }
-
-    #[test]
-    fn swap_exchanges_panes_and_keeps_sizes_in_place() {
-        // Row{ Col{1, 3}, 2 } with a wider left column.
-        let mut tree = Node::Leaf(1u64);
-        tree.split_focused(1, Axis::Row, 2);
-        tree.split_focused(1, Axis::Col, 3);
-        tree.resize(3, Axis::Row, 0.2);
-
-        assert!(tree.swap(3, 2));
-        let ids: Vec<u64> = tree.leaves().into_iter().copied().collect();
-        assert_eq!(ids, vec![1, 2, 3]); // 2 now bottom-left, 3 on the right
-        assert!(close(ratio_of(&tree), 0.7)); // the left column stays wide
-        assert_eq!(tree.focus_dir(2, FocusDir::Right).copied(), Some(3));
-
-        assert!(tree.swap(2, 3)); // and back
-        let ids: Vec<u64> = tree.leaves().into_iter().copied().collect();
-        assert_eq!(ids, vec![1, 3, 2]);
-
-        assert!(!tree.swap(1, 1));
-        assert!(!tree.swap(1, 9));
-        assert!(!Node::Leaf(1u64).swap(1, 2));
-    }
-
-    #[test]
-    fn floating_and_restoring_keeps_the_size() {
-        let mut tree = Node::Leaf(1u64);
-        tree.split_focused(1, Axis::Row, 2);
-        tree.resize(1, Axis::Row, 0.2);
-        let sized = tree.clone();
-        let placement = tree.placement(2).unwrap();
-        tree.remove(2);
-        assert!(tree.restore(&placement, 2));
-        assert_eq!(tree, sized);
-    }
-
-    #[test]
-    fn map_keeps_shape_and_sizes() {
-        let mut tree = Node::Leaf(1u64);
-        tree.split_focused(1, Axis::Row, 2);
-        tree.split_focused(1, Axis::Col, 3);
-        tree.resize(1, Axis::Row, 0.2);
-        let doubled = tree.map(&mut |id| id * 10);
-        assert_eq!(doubled.map(&mut |id| id / 10), tree);
-        let ids: Vec<u64> = doubled.leaves().into_iter().copied().collect();
-        assert_eq!(ids, vec![10, 30, 20]);
-    }
-
-    #[test]
-    fn split_focused_creates_sibling() {
-        let mut tree = Node::Leaf(1u64);
-        tree.split_focused(1, Axis::Row, 2);
-        assert_eq!(
-            tree,
-            Node::Split {
-                axis: Axis::Row,
-                ratio: 0.5,
-                first: Box::new(Node::Leaf(1)),
-                second: Box::new(Node::Leaf(2)),
-            }
-        );
-        assert!(tree.contains(2));
-    }
-
-    #[test]
-    fn remove_collapses_split() {
-        let mut tree = Node::Leaf(1u64);
-        tree.split_focused(1, Axis::Col, 2);
-        assert!(tree.remove(1));
-        assert_eq!(tree, Node::Leaf(2));
-        // removing a leaf that is not present leaves the tree untouched
-        assert!(tree.remove(1));
-        assert_eq!(tree, Node::Leaf(2));
-        assert!(!tree.remove(2));
-    }
-
-    #[test]
-    fn nested_split_keeps_sibling_subtree() {
-        // [1 | 2] with 1 split into [1 over 3]: Row{Col{1,3}, 2}
-        let mut tree = Node::Leaf(1u64);
-        tree.split_focused(1, Axis::Row, 2);
-        tree.split_focused(1, Axis::Col, 3);
-        assert!(tree.remove(1));
-        assert_eq!(
-            tree,
-            Node::Split {
-                axis: Axis::Row,
-                ratio: 0.5,
-                first: Box::new(Node::Leaf(3)),
-                second: Box::new(Node::Leaf(2)),
-            }
-        );
-    }
-
-    #[test]
-    fn focus_dir_navigates_siblings() {
-        // [3 | 4] over [1], with 2 to the right of both
-        let mut tree = Node::Leaf(1u64);
-        tree.split_focused(1, Axis::Row, 2);
-        tree.split_focused(1, Axis::Col, 3);
-        tree.split_focused(3, Axis::Row, 4);
-
-        // Layout: 1 top-left; 3 bottom-left, 4 bottom-right of left half; 2 right half
-        assert_eq!(tree.focus_dir(1, FocusDir::Right).copied(), Some(2));
-        assert_eq!(tree.focus_dir(2, FocusDir::Left).copied(), Some(4));
-        assert_eq!(tree.focus_dir(1, FocusDir::Down).copied(), Some(3));
-        assert_eq!(tree.focus_dir(1, FocusDir::Up).copied(), None);
-        assert_eq!(tree.focus_dir(3, FocusDir::Right).copied(), Some(4));
-        assert_eq!(tree.focus_dir(4, FocusDir::Left).copied(), Some(3));
-        assert_eq!(tree.focus_dir(4, FocusDir::Up).copied(), Some(1));
-        assert_eq!(tree.focus_dir(2, FocusDir::Right).copied(), None);
+    fn old_split_trees_load_as_main_and_stack() {
+        let old = "[split]\naxis = \"row\"\nratio = 0.5\n[split.first.leaf]\n[split.second.split]\naxis = \"col\"\nratio = 0.5\n[split.second.split.first.leaf]\n[split.second.split.second.leaf]\n";
+        #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+        struct P {}
+        let layout: Layout<P> = toml::from_str(old).unwrap();
+        assert_eq!(layout.slots.len(), 3);
+        let new = toml::to_string(&layout).unwrap();
+        assert_eq!(toml::from_str::<Layout<P>>(&new).unwrap(), layout);
     }
 }

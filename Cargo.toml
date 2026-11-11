@@ -1,6 +1,6 @@
 [package]
 name = "helterm"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "A Helix-centric project workspace manager: each workspace is a project folder with its editors, shells and tools arranged around it"
 repository = "https://github.com/joselevelsup/helterm"
@@ -8,12 +8,12 @@ license = "MIT"
 
 [dependencies]
 gpui = "0.2"
-alacritty_terminal = "0.24"
-portable-pty = "0.8"
+alacritty_terminal = "0.26"
+portable-pty = "0.9"
 async-channel = "2"
 # Both already in the tree via gpui: parsing the config adds nothing new to build.
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+toml = "1"
 
 [profile.release]
 lto = "thin"

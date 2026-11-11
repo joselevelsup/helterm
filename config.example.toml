@@ -67,8 +67,8 @@ use_helix_theme = false
 # A key belongs to one action: duplicates are reported, and a key you set
 # yourself wins over a default (between two of yours, the one listed first).
 [keybindings]
-split_right = "alt-enter"
-split_down = "alt-shift-enter"
+new_terminal = "alt-enter"     # bottom of the stack
+split_side = "alt-shift-enter" # right of the focused container
 new_editor = "alt-o"
 new_agent = "alt-a"   # runs [agent] command
 close_container = "alt-q"

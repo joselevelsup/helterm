@@ -26,7 +26,8 @@ panes are just how the project is laid out.
 - **[Helix](https://helix-editor.com) is first-class**: editor containers open
   Helix in the project, with a file explorer you can toggle next to them to
   open, create, rename and delete files from the keyboard.
-- **Tools around the editor**: shells in manual, Sway-style splits, tabs per
+- **Tools around the editor**: shells in a main-stack layout (main on the
+  left, the rest stacked on the right, side by side when you want), tabs per
   workspace, and floating terminals, including ones that run a command on a
   key (lazygit on `Alt+G`, say).
 - **Coding agents next to the editor**: agent containers run your preferred
@@ -82,7 +83,7 @@ Needs stable Rust and the X11/Wayland development headers, e.g. on Fedora
    press **Create**. With no folder chosen it opens your home folder.
 2. A new workspace (or tab) starts empty: press `Alt+Enter` for a terminal or
    `Alt+O` for a Helix editor.
-3. Split, open the explorer (`Alt+E` in an editor), add tabs (`Alt+T`), and so on.
+3. Add more containers, open the explorer (`Alt+E` in an editor), add tabs (`Alt+T`), and so on.
    A container closes when its program exits (`exit`, `:q` in Helix) or with
    `Alt+Q`. Close the window to quit.
 
@@ -265,10 +266,10 @@ Close a tab with the `×` on its title, or by closing its last container.
 
 | Keys | Action | Config name |
 | ---- | ------ | ----------- |
-| `Alt+Enter` | New terminal, split to the right | `split_right` |
-| `Alt+Shift+Enter` | New terminal, split below | `split_down` |
-| `Alt+O` | New Helix editor, split to the right | `new_editor` |
-| `Alt+A` | New coding agent (`[agent] command`), split to the right | `new_agent` |
+| `Alt+Enter` | New terminal at the bottom of the stack | `new_terminal` |
+| `Alt+Shift+Enter` | New terminal right of the focused one (side by side) | `split_side` |
+| `Alt+O` | New Helix editor at the bottom of the stack | `new_editor` |
+| `Alt+A` | New coding agent (`[agent] command`) at the bottom of the stack | `new_agent` |
 | `Alt+Q` | Close the focused container | `close_container` |
 | `Alt+H` / `Alt+J` / `Alt+K` / `Alt+L` | Move focus left / down / up / right | `focus_left` / `focus_down` / `focus_up` / `focus_right` |
 | `Alt+Z` | Maximize / restore the focused container (like tmux's zoom) | `toggle_maximize` |
@@ -276,6 +277,12 @@ Close a tab with the `×` on its title, or by closing its last container.
 | `Alt+F` | New floating terminal, or hide / show it | `toggle_floating` |
 | `Alt+Shift+F` | Float the focused container, or put the floating one back | `float_focused` |
 | `Alt+E` | Editor: open / focus its file explorer. Explorer: close it | `toggle_explorer` |
+
+Containers use a main-stack layout: the first one is **main**, on the left;
+every new one goes to the bottom of the **stack** on the right. Any slot (main
+or a stack entry) can hold several containers side by side (`Alt+Shift+Enter`).
+Closing main moves the top of the stack into its place. The old `split_right` /
+`split_down` config names still work as `new_terminal` / `split_side`.
 
 Each tab can have one floating shell (`Alt+F`) plus one per floating command;
 only one shows at a time. Every other key goes to the focused terminal or editor.
@@ -338,8 +345,8 @@ terminals.
 
 | Mode | Keys |
 | ---- | ---- |
-| Manage | `h` / `j` / `k` / `l` select a container, `r` resize, `m` move, `z` maximize it, `Esc` / `Enter` / `Alt+M` leave |
-| Resize | `l` / `h` wider / narrower, `j` / `k` taller / shorter, `Esc` back |
+| Manage | `h` / `j` / `k` / `l` select a container, `p` swap its slot with main, `r` resize, `m` move, `z` maximize it, `Esc` / `Enter` / `Alt+M` leave |
+| Resize | `l` / `h` move the main / stack edge right / left, `j` / `k` make a stack entry taller / shorter, `Esc` back |
 | Move | `h` / `j` / `k` / `l` swap with the neighbour on that side, `Esc` back |
 
 Leaving focuses the selected container. Entering un-maximizes and hides
@@ -385,7 +392,7 @@ the same archive in `dist/`.
 | ---- | ---- |
 | `src/workspace.rs` | Workspaces, tabs, actions, focus, dialogs, layout |
 | `src/terminal.rs` | PTY, `alacritty_terminal` grid, rendering, key translation |
-| `src/container.rs` | The Sway-style split tree |
+| `src/container.rs` | The main-stack layout |
 | `src/explorer.rs` | File explorer and its file operations |
 | `src/config.rs` | Config file: defaults, parsing with warnings, rebindable actions |
 | `src/helix_theme.rs` | Reads the Helix theme (`use_helix_theme`) and maps it to Helterm colors |
